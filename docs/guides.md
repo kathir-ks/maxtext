@@ -69,6 +69,13 @@ A step-by-step guide for the community to help expand MaxText's model library.
 
 How online distillation works in MaxText: loss anatomy, α / β / temperature schedule tuning, layer indices, monitoring metrics, and troubleshooting.
 :::
+
+:::{grid-item-card} 🔬 Activation Extraction
+:link: guides/activation_extraction
+:link-type: doc
+
+Offline capture of intermediate activations (residual stream, MLP / attention outputs) from any MaxText model into safetensors shards for SAE training and mechanistic interpretability research.
+:::
 ::::
 
 ```{toctree}
@@ -83,4 +90,5 @@ guides/monitoring_and_debugging.md
 guides/run_python_notebook.md
 guides/model_bringup.md
 guides/distillation.md
+guides/activation_extraction.md
 ```

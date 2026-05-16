@@ -107,6 +107,16 @@ Check out these getting started guides:
   * [RL on Single-Host TPUs](https://maxtext.readthedocs.io/en/latest/tutorials/posttraining/rl.html)
   * [RL on Multi-Host TPUs](https://maxtext.readthedocs.io/en/latest/tutorials/posttraining/rl_on_multi_host.html)
 
+### Mechanistic interpretability and SAE training
+
+MaxText ships an offline tool to extract intermediate activations
+(post-block residual stream, MLP / attention outputs) from any
+supported model into safetensors shards compatible with
+[EleutherAI `sparsify`](https://github.com/EleutherAI/sparsify) and
+[`sae_lens`](https://github.com/jbloomAus/SAELens). See the
+[Activation Extraction guide](https://maxtext.readthedocs.io/en/latest/guides/activation_extraction.html)
+for usage and the design.
+
 ### Model library
 
 MaxText aims to provide you with the best OSS models, whether as a reference implementation, or to post-train and then serve with vLLM.
