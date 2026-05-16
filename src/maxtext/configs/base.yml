@@ -406,6 +406,25 @@ fused_mlp: False
 
 record_internal_nn_metrics: 0
 
+# ======================== Activation Extraction =====================
+# Offline tool that writes intermediate residual-stream / MLP / attention
+# activations to safetensors shards for SAE training and mechanistic
+# interpretability. Driven by `python -m maxtext.tools.extract_activations.main`.
+# Has zero impact on training/inference when activation_extraction_enabled=False.
+activation_extraction_enabled: False
+activation_extraction_layers: []            # empty -> [N//4, N//2, 3N//4]
+activation_extraction_hooks: ["residual_post"]
+activation_extraction_output_path: ""
+activation_extraction_shard_size_tokens: 2000000
+activation_extraction_output_dtype: "bfloat16"
+activation_extraction_max_tokens: 0
+activation_extraction_skip_bos: True
+activation_extraction_dataset: "jsonl"
+activation_extraction_dataset_path: ""
+activation_extraction_dataset_split: "train"
+activation_extraction_text_key: "text"
+activation_extraction_max_documents: 0
+
 # Output directory
 # Create a GCS bucket, e.g. my-maxtext-outputs and set this to "gs://my-maxtext-outputs/"
 base_output_directory: ""

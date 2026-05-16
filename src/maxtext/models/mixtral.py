@@ -187,6 +187,15 @@ class MixtralDecoderLayer(nnx.Module):
           jnp.sum(layer_output == 0) / jnp.size(layer_output),
       )
 
+    from maxtext.tools.extract_activations.hooks import maybe_sow_activations
+    maybe_sow_activations(
+        self,
+        config=self.config,
+        layer_output=layer_output,
+        mlp_out=mlp_lnx,
+        attn_out=attention_lnx,
+    )
+
     if self.config.scan_layers:
       return layer_output, None
     else:

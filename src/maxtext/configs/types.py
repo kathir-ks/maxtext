@@ -1654,6 +1654,78 @@ class StackTrace(BaseModel):
   stack_trace_interval_seconds: int = Field(600, description="Frequency of stack trace collection in seconds.")
 
 
+class ActivationExtraction(BaseModel):
+  """Configuration for offline activation extraction (SAE / interp).
+
+  When ``activation_extraction_enabled`` is True, ``DecoderLayer`` sows
+  full activation tensors into Flax's "intermediates" collection and the
+  ``MaxEngine`` prefill path collects them. These fields are read by the
+  ``maxtext.tools.extract_activations`` CLI; they are no-ops when the
+  flag is False, and ``DecoderLayer`` compiles to identical HLO in that
+  case (the guarded ``sow`` block is dead-code eliminated by JAX).
+  """
+
+  activation_extraction_enabled: bool = Field(
+      False,
+      description="If True, sow full activation tensors during the forward pass "
+                  "and enable the extract_activations tool path.",
+  )
+  activation_extraction_layers: list[int] = Field(
+      [],
+      description="Layer indices to write to disk. Negative indices count from "
+                  "the top. Empty means [N//4, N//2, 3N//4] where N is the "
+                  "number of decoder layers.",
+  )
+  activation_extraction_hooks: list[Literal["residual_post", "mlp_out", "attn_out"]] = Field(
+      ["residual_post"],
+      description="Hook points to capture per layer.",
+  )
+  activation_extraction_output_path: str = Field(
+      "",
+      description="Local directory or gs:// path for shard output. Required when "
+                  "activation_extraction_enabled is True.",
+  )
+  activation_extraction_shard_size_tokens: int = Field(
+      2_000_000,
+      description="Tokens per safetensors shard. ~4 GB at d_model=2048, bf16.",
+  )
+  activation_extraction_output_dtype: Literal["bfloat16", "float16", "float32"] = Field(
+      "bfloat16",
+      description="Storage dtype for written activations.",
+  )
+  activation_extraction_max_tokens: int = Field(
+      0,
+      description="Stop after this many tokens have been written per layer. "
+                  "0 means no limit.",
+  )
+  activation_extraction_skip_bos: bool = Field(
+      True,
+      description="If True, drop the first token of each sequence (BOS has an "
+                  "uninformative residual).",
+  )
+  activation_extraction_dataset: Literal["jsonl", "hf", "pretokenized"] = Field(
+      "jsonl",
+      description="Dataset backend for the extraction tool.",
+  )
+  activation_extraction_dataset_path: str = Field(
+      "",
+      description="Path or HF dataset name for the chosen extraction dataset.",
+  )
+  activation_extraction_dataset_split: str = Field(
+      "train",
+      description="HF dataset split (ignored for jsonl / pretokenized backends).",
+  )
+  activation_extraction_text_key: str = Field(
+      "text",
+      description="JSON/HF field that contains the text to tokenize.",
+  )
+  activation_extraction_max_documents: int = Field(
+      0,
+      description="Hard cap on number of documents to read across all hosts "
+                  "(0 = no limit).",
+  )
+
+
 class Metrics(BaseModel):
   """General configuration for metrics and monitoring."""
 
@@ -2217,6 +2289,7 @@ class MaxTextConfig(
     StackTrace,
     # Metrics and Monitoring
     Metrics,
+    ActivationExtraction,
     Goodput,
     GcpMonitoring,
     Tensorboard,

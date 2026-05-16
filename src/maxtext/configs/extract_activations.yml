@@ -1,0 +1,54 @@
+# Copyright 2023-2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+
+# Example configuration preset for activation extraction.
+#
+# This file imports base.yml defaults and turns on extraction. Override
+# model_name, load_parameters_path, output_path, and dataset_path on the
+# CLI when invoking:
+#
+#   python -m maxtext.tools.extract_activations.main \
+#     src/maxtext/configs/extract_activations.yml \
+#     model_name=qwen3-30b-a3b \
+#     load_parameters_path=gs://your-bucket/path/items/0 \
+#     activation_extraction_output_path=gs://your-bucket/sae-data/v1 \
+#     activation_extraction_dataset_path=gs://your-bucket/pile_subset.jsonl \
+#     per_device_batch_size=1 \
+#     max_prefill_predict_length=2048
+
+base_config: "base.yml"
+
+# === Extraction switches ===
+activation_extraction_enabled: True
+# Default layers (empty) picks [N//4, N//2, 3N//4] automatically.
+activation_extraction_layers: []
+activation_extraction_hooks: ["residual_post"]
+activation_extraction_shard_size_tokens: 2000000
+activation_extraction_output_dtype: "bfloat16"
+activation_extraction_max_tokens: 0
+activation_extraction_skip_bos: True
+
+# === Dataset ===
+# Change to "hf" to stream from HuggingFace, or "pretokenized" to read a
+# pre-built numpy array of token ids.
+activation_extraction_dataset: "jsonl"
+activation_extraction_dataset_split: "train"
+activation_extraction_text_key: "text"
+activation_extraction_max_documents: 0
+
+# === Inference shape ===
+# A small per_device_batch_size and a moderate prefill length is usually
+# the right starting point. Tune up if you have headroom.
+per_device_batch_size: 1
+max_prefill_predict_length: 2048
+
+# === MaxEngine knobs ===
+# These mirror typical decode-style inference settings so MaxEngine
+# initialises cleanly. Adjust to match your serving config.
+attention: "dot_product"
+scan_layers: True

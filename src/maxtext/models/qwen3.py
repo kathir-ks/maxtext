@@ -1239,6 +1239,15 @@ class Qwen3DecoderLayer(AttentionWithNorm):
     layer_output = intermediate_inputs + mlp_lnx
     layer_output = nn.with_logical_constraint(layer_output, self.activation_axis_names)
 
+    from maxtext.tools.extract_activations.hooks import maybe_sow_activations
+    maybe_sow_activations(
+        self,
+        config=self.config,
+        layer_output=layer_output,
+        mlp_out=mlp_lnx,
+        attn_out=None,  # attention_lnx not preserved in this layer impl
+    )
+
     return layer_output, kv_cache
 
 
@@ -1312,6 +1321,15 @@ class Qwen3MoeDecoderLayer(AttentionWithNorm):
 
     layer_output = intermediate_inputs + mlp_lnx
     layer_output = nn.with_logical_constraint(layer_output, self.activation_axis_names)
+
+    from maxtext.tools.extract_activations.hooks import maybe_sow_activations
+    maybe_sow_activations(
+        self,
+        config=self.config,
+        layer_output=layer_output,
+        mlp_out=mlp_lnx,
+        attn_out=None,
+    )
 
     if is_scan_carry:
 

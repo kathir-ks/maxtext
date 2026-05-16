@@ -223,6 +223,18 @@ class DecoderLayer(nn.Module):
           jnp.sum(layer_output == 0) / jnp.size(layer_output),
       )
 
+    # Activation extraction (SAE / interpretability). Guarded so it is a
+    # complete no-op when disabled: the un-taken branches are dead-code
+    # eliminated after Flax tracing and the forward HLO is unchanged.
+    from maxtext.tools.extract_activations.hooks import maybe_sow_activations
+    maybe_sow_activations(
+        self,
+        config=cfg,
+        layer_output=layer_output,
+        mlp_out=mlp_lnx,
+        attn_out=attention_lnx,
+    )
+
     if cfg.scan_layers:
       return layer_output, None
     else:
