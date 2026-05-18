@@ -164,6 +164,29 @@ def convert_hf_to_maxtext(base_model_path: str, model_params: dict) -> dict:
         f"HF checkpoint at {base_model_path} is missing safetensors shard files: {missing_files}"
     )
 
+  # Surface the expected RAM peak before we ask numpy for ~hundreds of GB,
+  # so users on undersized hosts see "you need a bigger box" instead of an
+  # opaque OOM kill.
+  per_expert = (
+      num_layers * hidden_size * ffn_dim * 2  # wi_0
+      + num_layers * hidden_size * ffn_dim * 2  # wi_1
+      + num_layers * ffn_dim * hidden_size * 2  # wo
+  )
+  expert_bytes = num_experts * per_expert
+  non_expert_bytes = (
+      vocab_size * hidden_size * 2 * 2  # embed + lm_head (transposed)
+      + hidden_size * 2  # final norm
+      + num_layers * 4 * hidden_size * 2  # pre/post attn norm + q_norm + k_norm (approx, generous)
+      + num_layers * (num_heads + 2 * num_kv_heads + num_heads) * head_dim * hidden_size * 2  # q/k/v/o
+      + num_layers * (num_experts * (hidden_size + 1)) * 2  # gate kernel + bias
+  )
+  total_gb = (expert_bytes + non_expert_bytes) / (1024 ** 3)
+  max_logging.log(
+      f"MiniMax converter: pre-allocating ~{total_gb:.1f} GiB of float16 numpy "
+      f"({num_experts}x experts dominate). Make sure your host has at least "
+      f"{int(total_gb * 1.3 + 50)} GiB free RAM (≥30% headroom + working set)."
+  )
+
   cache: dict = {}
 
   def get(name: str) -> np.ndarray:
