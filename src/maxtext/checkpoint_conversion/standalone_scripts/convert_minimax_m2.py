@@ -209,14 +209,14 @@ def convert_hf_to_maxtext(base_model_path: str, model_params: dict) -> dict:
     attn["key_norm"]["scale"][l] = get(f"model.layers.{l}.self_attn.k_norm.weight")
 
     # MoE — note expert weight naming uses w1/w2/w3.
-    moe["gate"]["kernel"][l] = get(f"model.layers.{l}.mlp.gate.weight").T
-    moe["gate"]["bias"][l] = get(f"model.layers.{l}.mlp.e_score_correction_bias")
+    moe["gate"]["kernel"][l] = get(f"model.layers.{l}.block_sparse_moe.gate.weight").T
+    moe["gate"]["bias"][l] = get(f"model.layers.{l}.block_sparse_moe.e_score_correction_bias")
 
     for e in range(num_experts):
       # w1: gate_proj (silu side) -> wi_0; w3: up_proj (linear side) -> wi_1; w2: down_proj -> wo
-      moe["wi_0"][e, l] = get(f"model.layers.{l}.mlp.experts.{e}.w1.weight").T
-      moe["wi_1"][e, l] = get(f"model.layers.{l}.mlp.experts.{e}.w3.weight").T
-      moe["wo"][e, l] = get(f"model.layers.{l}.mlp.experts.{e}.w2.weight").T
+      moe["wi_0"][e, l] = get(f"model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight").T
+      moe["wi_1"][e, l] = get(f"model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight").T
+      moe["wo"][e, l] = get(f"model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight").T
 
     # Drop file handles to keep the FD count and mmap pressure low.
     cache.clear()

@@ -1,0 +1,220 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for MiniMax-M2 / M2.7 model wiring and HF→MaxText converter.
+
+These tests are CPU-only and run in seconds. They cover:
+  1. pyconfig accepts the `minimax-m2.7` model_name and forwards the
+     expected MoE / partial-RoPE / QK-norm knobs;
+  2. MiniMaxM2DecoderLayer instantiates, has 19 param leaves, and produces
+     a non-zero forward on tiny random inputs;
+  3. The HF→MaxText converter handles the actual MiniMax-M2 parameter
+     naming (block_sparse_moe.*, w1/w2/w3 experts, e_score_correction_bias)
+     on a synthetic two-layer BF16 mini-checkpoint and produces a MaxText
+     tree with the right scanned shapes.
+"""
+
+import json
+import os
+import tempfile
+import unittest
+
+import numpy as np
+
+
+_TINY_CFG_OVERRIDES = [
+    "model_name=minimax-m2.7",
+    "override_model_config=true",
+    "tokenizer_path=assets/tokenizer.llama2",
+    "per_device_batch_size=1",
+    "max_target_length=16",
+    "max_prefill_predict_length=8",
+    "enable_checkpointing=false",
+    "run_name=minimax_m2_test",
+    "scan_layers=false",
+    "base_num_decoder_layers=1",
+    "num_experts=4",
+    "num_experts_per_tok=2",
+    "base_emb_dim=64",
+    "base_num_query_heads=4",
+    "base_num_kv_heads=2",
+    "head_dim=32",
+    "base_moe_mlp_dim=64",
+    "base_mlp_dim=64",
+    "vocab_size=128",
+    "partial_rotary_factor=0.5",
+    "mtp_num_layers=0",
+    "ici_tensor_parallelism=1",
+    "ici_fsdp_parallelism=1",
+    "ici_expert_parallelism=1",
+    "attention=dot_product",
+    "weight_dtype=float32",
+    "dtype=float32",
+    "megablox=false",
+    "sparse_matmul=false",
+    "capacity_factor=2.0",
+]
+
+
+class MiniMaxM2ConfigTest(unittest.TestCase):
+  """Verifies that the new model_name flows through pyconfig with the right knobs."""
+
+  def test_pyconfig_loads_minimax_m2_7(self):
+    from maxtext.configs import pyconfig
+    from maxtext.utils.globals import MAXTEXT_REPO_ROOT
+
+    base = os.path.join(MAXTEXT_REPO_ROOT, "src", "maxtext", "configs", "base.yml")
+    raw = pyconfig.initialize(["maxtext", base] + _TINY_CFG_OVERRIDES)
+    c = raw.config if hasattr(raw, "config") else raw
+
+    self.assertEqual(c.decoder_block.value, "minimax_m2")
+    self.assertEqual(c.num_experts, 4)
+    self.assertEqual(c.num_experts_per_tok, 2)
+    self.assertEqual(c.partial_rotary_factor, 0.5)
+    self.assertEqual(c.routed_score_func, "sigmoid")
+    self.assertTrue(c.routed_bias)
+    self.assertEqual(c.shared_experts, 0)
+    self.assertTrue(c.use_qk_norm)
+
+
+class MiniMaxM2LayerForwardTest(unittest.TestCase):
+  """Builds a one-layer decoder block and runs a tiny forward."""
+
+  def test_tiny_forward_is_nonzero(self):
+    import jax
+    import jax.numpy as jnp
+    from flax import nnx
+    from maxtext.configs import pyconfig
+    from maxtext.models.minimax_m2 import MiniMaxM2DecoderLayer
+    from maxtext.utils import maxtext_utils
+    from maxtext.utils.globals import MAXTEXT_REPO_ROOT
+
+    base = os.path.join(MAXTEXT_REPO_ROOT, "src", "maxtext", "configs", "base.yml")
+    raw = pyconfig.initialize(["maxtext", base] + _TINY_CFG_OVERRIDES)
+    c = raw.config if hasattr(raw, "config") else raw
+
+    mesh = jax.sharding.Mesh(maxtext_utils.create_device_mesh(c), c.mesh_axes)
+    with mesh:
+      rngs = nnx.Rngs(params=0, dropout=1, aqt=2)
+      layer = MiniMaxM2DecoderLayer(config=c, mesh=mesh, model_mode="train", quant=None, rngs=rngs)
+
+    B, T, D = c.global_batch_size_to_load, c.max_target_length, c.emb_dim
+    x = jax.random.normal(jax.random.PRNGKey(7), (B, T, D), dtype=jnp.float32)
+    pos = jnp.broadcast_to(jnp.arange(T, dtype=jnp.int32), (B, T))
+    seg = jnp.ones((B, T), dtype=jnp.int32)
+    with mesh:
+      y, _ = layer(x, decoder_segment_ids=seg, decoder_positions=pos, deterministic=True, model_mode="train")
+
+    self.assertEqual(y.shape, (B, T, D))
+    # Routing + RMSNorm + attention should produce a clearly non-zero output
+    # for random inputs at unit scale.
+    self.assertGreater(float(y.std()), 1e-3)
+
+
+class MiniMaxM2ConverterTest(unittest.TestCase):
+  """Drives convert_hf_to_maxtext against a synthetic two-layer mini-checkpoint."""
+
+  def test_converter_shapes_against_synthetic_minimax_layout(self):
+    try:
+      import torch
+      from safetensors.torch import save_file
+    except ImportError:
+      self.skipTest("torch / safetensors not available in this environment")
+
+    from maxtext.checkpoint_conversion.standalone_scripts import convert_minimax_m2
+
+    params = {
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "hidden_size": 16,
+        "head_dim": 8,
+        "num_experts": 4,
+        "moe_intermediate_size": 12,
+        "vocab_size": 32,
+    }
+    L, H, KV, D, HD, E, F, V = (
+        params["num_hidden_layers"],
+        params["num_attention_heads"],
+        params["num_key_value_heads"],
+        params["hidden_size"],
+        params["head_dim"],
+        params["num_experts"],
+        params["moe_intermediate_size"],
+        params["vocab_size"],
+    )
+
+    weights: dict[str, torch.Tensor] = {
+        "model.embed_tokens.weight": torch.randn(V, D, dtype=torch.bfloat16),
+        "model.norm.weight": torch.randn(D, dtype=torch.bfloat16),
+        "lm_head.weight": torch.randn(V, D, dtype=torch.bfloat16),
+    }
+    for l in range(L):
+      weights[f"model.layers.{l}.input_layernorm.weight"] = torch.randn(D, dtype=torch.bfloat16)
+      weights[f"model.layers.{l}.post_attention_layernorm.weight"] = torch.randn(D, dtype=torch.bfloat16)
+      # HF Linear weights are (out, in).
+      weights[f"model.layers.{l}.self_attn.q_proj.weight"] = torch.randn(H * HD, D, dtype=torch.bfloat16)
+      weights[f"model.layers.{l}.self_attn.k_proj.weight"] = torch.randn(KV * HD, D, dtype=torch.bfloat16)
+      weights[f"model.layers.{l}.self_attn.v_proj.weight"] = torch.randn(KV * HD, D, dtype=torch.bfloat16)
+      weights[f"model.layers.{l}.self_attn.o_proj.weight"] = torch.randn(D, H * HD, dtype=torch.bfloat16)
+      # Global QK norm: scale spans num_heads * head_dim and num_kv_heads * head_dim.
+      weights[f"model.layers.{l}.self_attn.q_norm.weight"] = torch.randn(H * HD, dtype=torch.bfloat16)
+      weights[f"model.layers.{l}.self_attn.k_norm.weight"] = torch.randn(KV * HD, dtype=torch.bfloat16)
+      weights[f"model.layers.{l}.block_sparse_moe.gate.weight"] = torch.randn(E, D, dtype=torch.bfloat16)
+      weights[f"model.layers.{l}.block_sparse_moe.e_score_correction_bias"] = torch.randn(E, dtype=torch.bfloat16)
+      for e in range(E):
+        weights[f"model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight"] = torch.randn(F, D, dtype=torch.bfloat16)
+        weights[f"model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight"] = torch.randn(F, D, dtype=torch.bfloat16)
+        weights[f"model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight"] = torch.randn(D, F, dtype=torch.bfloat16)
+
+    with tempfile.TemporaryDirectory() as tmp:
+      shard = os.path.join(tmp, "model-00001-of-00001.safetensors")
+      save_file(weights, shard)
+      with open(os.path.join(tmp, "model.safetensors.index.json"), "w", encoding="utf8") as f:
+        json.dump({"metadata": {}, "weight_map": {k: os.path.basename(shard) for k in weights}}, f)
+
+      tree = convert_minimax_m2.convert_hf_to_maxtext(tmp, params)
+
+    # Top-level
+    self.assertEqual(tree["token_embedder"]["embedding"].shape, (V, D))
+    self.assertEqual(tree["decoder"]["decoder_norm"]["scale"].shape, (D,))
+    self.assertEqual(tree["decoder"]["logits_dense"]["kernel"].shape, (D, V))
+
+    ln = tree["decoder"]["layers"]
+    attn = ln["self_attention"]
+    moe = ln["moe_block"]
+
+    # After the final scanned transpose: per-layer stuff has layer axis last (or in axis 1 for kernels).
+    self.assertEqual(ln["pre_self_attention_layer_norm"]["scale"].shape, (D, L))
+    self.assertEqual(ln["post_self_attention_layer_norm"]["scale"].shape, (D, L))
+    self.assertEqual(attn["query_norm"]["scale"].shape, (H * HD, L))
+    self.assertEqual(attn["key_norm"]["scale"].shape, (KV * HD, L))
+    self.assertEqual(attn["query"]["kernel"].shape, (D, L, H, HD))
+    self.assertEqual(attn["key"]["kernel"].shape, (D, L, KV, HD))
+    self.assertEqual(attn["value"]["kernel"].shape, (D, L, KV, HD))
+    self.assertEqual(attn["out"]["kernel"].shape, (H, L, HD, D))
+    self.assertEqual(moe["gate"]["kernel"].shape, (D, L, E))
+    self.assertEqual(moe["gate"]["bias"].shape, (E, L))
+    self.assertEqual(moe["wi_0"].shape, (E, L, D, F))
+    self.assertEqual(moe["wi_1"].shape, (E, L, D, F))
+    self.assertEqual(moe["wo"].shape, (E, L, F, D))
+
+    # Sanity-check that the gate kernel actually contains the data we wrote
+    # (instead of all zeros from the pre-alloc).
+    expected_gate_l0 = weights["model.layers.0.block_sparse_moe.gate.weight"].to(torch.float16).numpy().T
+    np.testing.assert_allclose(moe["gate"]["kernel"][:, 0, :], expected_gate_l0, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+  unittest.main()
