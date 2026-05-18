@@ -122,6 +122,69 @@ class MiniMaxM2LayerForwardTest(unittest.TestCase):
     self.assertGreater(float(y.std()), 1e-3)
 
 
+class MiniMaxM2RoutingSemanticsTest(unittest.TestCase):
+  """Verifies that the MoE routing matches MiniMax-M2's reference behaviour:
+    1) top-k is taken over (sigmoid(logits) + bias) for *selection*;
+    2) the combine weights are the *unbiased* sigmoid scores at chosen experts;
+    3) those combine weights are renormalised to sum to 1 across the top-k.
+  """
+
+  def test_topk_uses_biased_scores_but_combine_weights_are_unbiased(self):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from flax import nnx
+    from maxtext.configs import pyconfig
+    from maxtext.layers import moe
+    from maxtext.utils import maxtext_utils
+    from maxtext.utils.globals import MAXTEXT_REPO_ROOT
+
+    base = os.path.join(MAXTEXT_REPO_ROOT, "src", "maxtext", "configs", "base.yml")
+    raw = pyconfig.initialize(["maxtext", base] + _TINY_CFG_OVERRIDES)
+    c = raw.config if hasattr(raw, "config") else raw
+
+    mesh = jax.sharding.Mesh(maxtext_utils.create_device_mesh(c), c.mesh_axes)
+    with mesh:
+      rngs = nnx.Rngs(params=0, dropout=1, aqt=2)
+      moe_block = moe.RoutedMoE(
+          config=c,
+          num_experts=c.num_experts,
+          num_experts_per_tok=c.num_experts_per_tok,
+          mesh=mesh,
+          kernel_init=lambda key, shape, dtype, a, b: jax.random.normal(key, shape, dtype),
+          kernel_axes=("embed", None),
+          intermediate_dim=c.moe_mlp_dim,
+          dtype=jnp.float32,
+          weight_dtype=jnp.float32,
+          quant=None,
+          rngs=rngs,
+      )
+
+    # Hand-craft gate logits so the bias actively changes the top-k selection.
+    B, T, E, K = 1, 1, c.num_experts, c.num_experts_per_tok
+    self.assertEqual((E, K), (4, 2))
+    raw_logits = jnp.array([[[1.0, 2.0, 3.0, 4.0]]])  # sigmoid descending experts 3>2>1>0
+    bias = jnp.array([5.0, 0.0, 0.0, 0.0])             # bias flips expert 0 to top
+    # gate_logits seen by get_topk is sigmoid(raw_logits) + bias
+    sigmoid_scores = jax.nn.sigmoid(raw_logits.astype(jnp.float32))
+    biased = sigmoid_scores + bias
+    pre_bias = sigmoid_scores  # unbiased sigmoid scores
+    top_k_weights, top_k_indices = moe_block.get_topk(biased, pre_bias, rngs=rngs)
+
+    # Selection should pick expert 0 (because of bias) and expert 3 (highest sigmoid).
+    self.assertEqual(set(np.asarray(top_k_indices).flatten().tolist()), {0, 3})
+
+    # Combine weights should be the *unbiased* sigmoid values at chosen experts,
+    # renormalised to sum to 1.
+    expected_unbiased = np.array([sigmoid_scores[0, 0, 0], sigmoid_scores[0, 0, 3]])
+    expected_combine = expected_unbiased / expected_unbiased.sum()
+    flat = np.asarray(top_k_weights).reshape(-1)
+    # Sort both pairs so we can compare regardless of internal ordering.
+    np.testing.assert_allclose(np.sort(flat), np.sort(expected_combine), rtol=1e-5, atol=1e-6)
+    # Sum-to-one (within the top-k).
+    np.testing.assert_allclose(float(flat.sum()), 1.0, rtol=1e-5, atol=1e-6)
+
+
 class MiniMaxM2ConverterTest(unittest.TestCase):
   """Drives convert_hf_to_maxtext against a synthetic two-layer mini-checkpoint."""
 

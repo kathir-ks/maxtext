@@ -297,7 +297,10 @@ class GateLogit(nnx.Module):
 
     if self.score_func:
       output = linears._convert_to_activation_function(self.score_func)(output)
-      if self.model_name.startswith("deepseek3"):
+      # Pre-bias activations are needed when the model uses bias-aware
+      # selection but unbiased combine weights (DeepSeek-V3 and the MiniMax-M2
+      # family, both sigmoid-routed with a learnable e_score_correction_bias).
+      if self.model_name.startswith("deepseek3") or self.model_name.startswith("minimax-m2"):
         pre_bias_logits = output
 
     if self.use_bias:
@@ -599,7 +602,7 @@ class RoutedMoE(nnx.Module):
       top_k_weights, top_k_indices = random_routing(rng, gate_logits, self.num_experts_per_tok)
       return top_k_weights, top_k_indices
 
-    if self.config.model_name.startswith("deepseek3"):
+    if self.config.model_name.startswith("deepseek3") or self.config.decoder_block == ctypes.DecoderBlockType.MINIMAX_M2:
       top_k_weights, top_k_indices = self.deepseek_routing(gate_logits, pre_bias_logits)
     elif self.config.decoder_block == ctypes.DecoderBlockType.GEMMA4:
       router_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
@@ -608,7 +611,7 @@ class RoutedMoE(nnx.Module):
     else:
       top_k_weights, top_k_indices = jax.lax.top_k(gate_logits, self.num_experts_per_tok)
 
-    if self.config.decoder_block == ctypes.DecoderBlockType.DEEPSEEK:
+    if self.config.decoder_block in (ctypes.DecoderBlockType.DEEPSEEK, ctypes.DecoderBlockType.MINIMAX_M2):
       top_k_weights = self.deepseek_scale_weights(top_k_weights)
     elif self.config.decoder_block not in (ctypes.DecoderBlockType.LLAMA4, ctypes.DecoderBlockType.GEMMA4):
       top_k_weights = jax.nn.softmax(top_k_weights.astype(jnp.float32), axis=-1).astype(self.dtype)
@@ -1847,8 +1850,9 @@ class RoutedMoE(nnx.Module):
     """Dense matrix multiplication."""
     # gate_logits: batch, length, expert
     gate_logits = self._maybe_shard_with_logical(gate_logits, ("activation_batch_moe", "activation_length_moe", None))
-    if self.config.model_name.startswith("deepseek3"):
-      # pre_bias_logits is None for non-DeepSeek v3 models
+    if self.config.model_name.startswith("deepseek3") or self.config.decoder_block == ctypes.DecoderBlockType.MINIMAX_M2:
+      # pre_bias_logits is None unless the model uses bias-aware top-k +
+      # unbiased combine weights (DeepSeek-V3 and MiniMax-M2 family).
       pre_bias_logits = self._maybe_shard_with_logical(
           pre_bias_logits, ("activation_batch_moe", "activation_length_moe", None)
       )
