@@ -55,6 +55,7 @@ from maxtext.models import (
     gpt_oss,
     llama2,
     llama4,
+    minimax_m2,
     mistral,
     mixtral,
     olmo3,
@@ -692,6 +693,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.QWEN3_5: get_scannable(qwen3_5.Qwen3_5DecoderLayer, qwen3_5.Qwen3_5ScannableBlock),
         DecoderBlockType.LLAMA4: get_scannable(llama4.Llama4DecoderLayer, llama4.Llama4ScannableBlock),
         DecoderBlockType.OLMO3: get_scannable(olmo3.Olmo3DecoderLayer, olmo3.Olmo3ScannableBlock),
+        DecoderBlockType.MINIMAX_M2: [minimax_m2.MiniMaxM2DecoderLayer],
     }
 
     if cfg.decoder_block not in layer_map:
@@ -837,6 +839,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
+        DecoderBlockType.MINIMAX_M2,
     ):
       return functools.partial(RMSNorm, num_features=num_features, shard_mode=self.config.shard_mode, rngs=rngs)
     elif self.config.decoder_block == DecoderBlockType.GPT3:

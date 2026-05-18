@@ -1129,6 +1129,7 @@ class AttentionWithNorm(nnx.Module):
         model_mode=model_mode,
         use_mrope=config.use_mrope,
         mrope_section=config.mrope_section,
+        partial_rotary_factor=config.partial_rotary_factor,
         rngs=rngs,
     )
 

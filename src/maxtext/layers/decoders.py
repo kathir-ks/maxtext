@@ -51,6 +51,7 @@ from maxtext.models import (
     gpt_oss,
     llama2,
     llama4,
+    minimax_m2,
     mistral,
     mixtral,
     olmo3,
@@ -494,6 +495,8 @@ class Decoder(nn.Module):
         return [llama4.Llama4ScannableBlockToLinen] if self.config.scan_layers else [llama4.Llama4DecoderLayerToLinen]
       case DecoderBlockType.OLMO3:
         return [olmo3.Olmo3ScannableBlockToLinen] if self.config.scan_layers else [olmo3.Olmo3DecoderLayerToLinen]
+      case DecoderBlockType.MINIMAX_M2:
+        return [minimax_m2.MiniMaxM2DecoderLayerToLinen]
 
       case _:
         # Default case to handle any unknown decoder block types.
@@ -549,6 +552,7 @@ class Decoder(nn.Module):
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
         DecoderBlockType.LLAMA2LTI,
+        DecoderBlockType.MINIMAX_M2,
     ):
       return functools.partial(rms_norm, num_features=num_features, shard_mode=self.config.shard_mode)
     elif self.config.decoder_block == DecoderBlockType.GPT3:

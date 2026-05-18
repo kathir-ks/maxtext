@@ -271,6 +271,8 @@ ModelName = Literal[
     "olmo3-7b",
     "olmo3-7b-pt",
     "olmo3-32b",
+    "minimax-m2",
+    "minimax-m2.7",
 ]
 
 
@@ -2786,7 +2788,7 @@ class MaxTextConfig(
           and self.inhomogeneous_layer_cycle_interval == 1
       )
       if is_fully_moe and self.base_mlp_dim != self.base_moe_mlp_dim:
-        if self.decoder_block == DecoderBlockType.QWEN3_MOE:
+        if self.decoder_block in (DecoderBlockType.QWEN3_MOE, DecoderBlockType.MINIMAX_M2):
           self.base_mlp_dim = self.base_moe_mlp_dim
           _, _, mlp_dim_scale, _ = get_individual_scales(self.global_parameter_scale)
           self.mlp_dim = (2**mlp_dim_scale) * self.base_mlp_dim
@@ -2893,9 +2895,15 @@ class MaxTextConfig(
       rotary_dim = int(self.head_dim * self.partial_rotary_factor)
       if rotary_dim % 2 != 0:
         raise ValueError(f"Calculated rotary dimension ({rotary_dim}) must be a multiple of 2.")
+    elif self.decoder_block == DecoderBlockType.MINIMAX_M2:
+      rotary_dim = int(self.head_dim * self.partial_rotary_factor)
+      if rotary_dim % 2 != 0:
+        raise ValueError(f"Calculated rotary dimension ({rotary_dim}) must be a multiple of 2.")
     else:
       if self.partial_rotary_factor is not None and self.partial_rotary_factor != 1.0:
-        raise ValueError("`partial_rotary_factor` is only effective when `decoder_block` is set to 'qwen3_next'.")
+        raise ValueError(
+            "`partial_rotary_factor` is only effective when `decoder_block` is set to 'qwen3_next', 'qwen3_5', or 'minimax_m2'."
+        )
 
     tokenizer_path = getattr(self, "tokenizer_path", None)
     if (
