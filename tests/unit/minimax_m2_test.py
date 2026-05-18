@@ -420,6 +420,77 @@ class MiniMaxM2CheckpointShapeAgreementTest(unittest.TestCase):
     self.assertEqual(mismatched, [], f"converter shape != model shape: {mismatched}")
 
 
+class MiniMaxM2PartialRoPENumericsTest(unittest.TestCase):
+  """Verifies MaxText's PartialRotaryEmbedding output matches the HF MiniMax-M2
+  reference (NeoX-style rotate_half, first rotary_dim rotated, rest pass-through,
+  frequency = base^(-2i/rotary_dim)) bit-for-bit within fp32 precision.
+
+  A wrong interleave/concat layout or off-by-one in rotary_dim would produce
+  plausible attention scores but silently degrade generation; this test
+  surfaces such bugs in milliseconds on CPU.
+  """
+
+  def test_partial_rope_matches_hf_reference(self):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from flax import nnx
+    from maxtext.layers.embeddings import PartialRotaryEmbedding
+
+    head_dim = 128
+    rotary_dim = 64
+    B, S, H = 1, 4, 2
+    rope_theta = 5_000_000
+
+    # Random inputs of shape [B, S, H, head_dim]
+    rng = np.random.default_rng(0)
+    x_np = rng.standard_normal((B, S, H, head_dim)).astype(np.float32)
+    positions_np = np.arange(S, dtype=np.int32)[None, :].repeat(B, axis=0)
+
+    # ---------- HF reference (numpy, NeoX-style) ----------
+    def hf_partial_rope(x: np.ndarray, positions: np.ndarray) -> np.ndarray:
+      half = rotary_dim // 2
+      inv_freq = 1.0 / (rope_theta ** (np.arange(0, rotary_dim, 2, dtype=np.float64) / rotary_dim))
+      # freqs: (B, S, half)
+      freqs = positions.astype(np.float64)[..., None] * inv_freq[None, None, :]
+      # emb: (B, S, rotary_dim)
+      emb = np.concatenate([freqs, freqs], axis=-1)
+      cos = np.cos(emb)[:, :, None, :]  # (B, S, 1, rotary_dim) — broadcast over heads
+      sin = np.sin(emb)[:, :, None, :]
+      x_rot = x[..., :rotary_dim]
+      x_pass = x[..., rotary_dim:]
+      # NeoX rotate_half: split into halves, then concat([-x2, x1])
+      x1, x2 = np.split(x_rot, 2, axis=-1)
+      rotated = np.concatenate([-x2, x1], axis=-1)
+      out_rot = x_rot * cos + rotated * sin
+      return np.concatenate([out_rot.astype(x.dtype), x_pass], axis=-1)
+
+    expected = hf_partial_rope(x_np, positions_np)
+
+    # ---------- MaxText PartialRotaryEmbedding ----------
+    devices = jax.devices()
+    mesh = jax.sharding.Mesh(np.array(devices).reshape(1, *((1,) * (len(devices) - 1))), ("data",))
+    rngs = nnx.Rngs(params=0)
+    rope = PartialRotaryEmbedding(
+        min_timescale=1,
+        max_timescale=rope_theta,
+        mesh=mesh,
+        embedding_dims=head_dim,
+        partial_rotary_factor=rotary_dim / head_dim,
+        cast_as_fprop_dtype=False,    # keep float32 to compare cleanly
+        fprop_dtype=jnp.float32,
+        rngs=rngs,
+    )
+    actual = np.asarray(rope(jnp.asarray(x_np, dtype=jnp.float32), jnp.asarray(positions_np)))
+
+    # The first rotary_dim columns must change; the last (head_dim - rotary_dim) must pass through unchanged.
+    np.testing.assert_allclose(actual[..., rotary_dim:], x_np[..., rotary_dim:], rtol=0, atol=0)
+    self.assertGreater(float(np.abs(actual[..., :rotary_dim] - x_np[..., :rotary_dim]).max()), 1e-3)
+
+    # Numeric match against HF reference.
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
 class MiniMaxM2OrbaxRoundTripTest(unittest.TestCase):
   """End-to-end: convert synthetic HF -> save Orbax -> restore -> shape check."""
 
