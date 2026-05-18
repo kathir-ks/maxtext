@@ -125,6 +125,45 @@ def convert_hf_to_maxtext(base_model_path: str, model_params: dict) -> dict:
   with open(index_file, "rt", encoding="utf8") as f:
     weight_map = json.load(f)["weight_map"]
 
+  # Fail fast if the HF download is incomplete. Filling missing slots with
+  # zeros silently would produce a checkpoint that decodes garbage on TPU —
+  # the kind of bug that takes hours to chase down.
+  expected = {"model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"}
+  for l in range(num_layers):
+    expected |= {
+        f"model.layers.{l}.input_layernorm.weight",
+        f"model.layers.{l}.post_attention_layernorm.weight",
+        f"model.layers.{l}.self_attn.q_proj.weight",
+        f"model.layers.{l}.self_attn.k_proj.weight",
+        f"model.layers.{l}.self_attn.v_proj.weight",
+        f"model.layers.{l}.self_attn.o_proj.weight",
+        f"model.layers.{l}.self_attn.q_norm.weight",
+        f"model.layers.{l}.self_attn.k_norm.weight",
+        f"model.layers.{l}.block_sparse_moe.gate.weight",
+        f"model.layers.{l}.block_sparse_moe.e_score_correction_bias",
+    }
+    for e in range(num_experts):
+      expected |= {
+          f"model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight",
+          f"model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight",
+          f"model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight",
+      }
+  missing = sorted(expected - set(weight_map))
+  if missing:
+    sample = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
+    raise RuntimeError(
+        f"HF checkpoint at {base_model_path} is missing {len(missing)} expected weights "
+        f"(first few: {sample}). Re-download or pass the correct path."
+    )
+
+  # Verify all shard files referenced by the index actually exist on disk.
+  shards = sorted({weight_map[k] for k in expected})
+  missing_files = [s for s in shards if not os.path.isfile(os.path.join(base_model_path, s))]
+  if missing_files:
+    raise RuntimeError(
+        f"HF checkpoint at {base_model_path} is missing safetensors shard files: {missing_files}"
+    )
+
   cache: dict = {}
 
   def get(name: str) -> np.ndarray:

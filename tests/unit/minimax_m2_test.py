@@ -616,6 +616,89 @@ class MiniMaxM2FP8DequantTest(unittest.TestCase):
     self.assertLess(float(rel_err), 0.10, f"rel_err = {float(rel_err):.4f}")
 
 
+class MiniMaxM2ConverterPreflightTest(unittest.TestCase):
+  """The converter should refuse to run on an incomplete HF checkpoint.
+  Silently filling missing slots with zeros would produce a checkpoint
+  that decodes garbage on TPU and takes hours to debug.
+  """
+
+  def _write_minimal_layout(self, hf_dir, params, drop_keys=()):
+    import torch
+    from safetensors.torch import save_file
+    L = params["num_hidden_layers"]; E = params["num_experts"]
+    D = params["hidden_size"]; HD = params["head_dim"]
+    H = params["num_attention_heads"]; KV = params["num_key_value_heads"]
+    F = params["moe_intermediate_size"]; V = params["vocab_size"]
+
+    w = {
+        "model.embed_tokens.weight": torch.zeros(V, D, dtype=torch.bfloat16),
+        "model.norm.weight": torch.zeros(D, dtype=torch.bfloat16),
+        "lm_head.weight": torch.zeros(V, D, dtype=torch.bfloat16),
+    }
+    for l in range(L):
+      w[f"model.layers.{l}.input_layernorm.weight"] = torch.zeros(D, dtype=torch.bfloat16)
+      w[f"model.layers.{l}.post_attention_layernorm.weight"] = torch.zeros(D, dtype=torch.bfloat16)
+      w[f"model.layers.{l}.self_attn.q_proj.weight"] = torch.zeros(H * HD, D, dtype=torch.bfloat16)
+      w[f"model.layers.{l}.self_attn.k_proj.weight"] = torch.zeros(KV * HD, D, dtype=torch.bfloat16)
+      w[f"model.layers.{l}.self_attn.v_proj.weight"] = torch.zeros(KV * HD, D, dtype=torch.bfloat16)
+      w[f"model.layers.{l}.self_attn.o_proj.weight"] = torch.zeros(D, H * HD, dtype=torch.bfloat16)
+      w[f"model.layers.{l}.self_attn.q_norm.weight"] = torch.zeros(H * HD, dtype=torch.bfloat16)
+      w[f"model.layers.{l}.self_attn.k_norm.weight"] = torch.zeros(KV * HD, dtype=torch.bfloat16)
+      w[f"model.layers.{l}.block_sparse_moe.gate.weight"] = torch.zeros(E, D, dtype=torch.bfloat16)
+      w[f"model.layers.{l}.block_sparse_moe.e_score_correction_bias"] = torch.zeros(E, dtype=torch.bfloat16)
+      for e in range(E):
+        w[f"model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight"] = torch.zeros(F, D, dtype=torch.bfloat16)
+        w[f"model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight"] = torch.zeros(D, F, dtype=torch.bfloat16)
+        w[f"model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight"] = torch.zeros(F, D, dtype=torch.bfloat16)
+
+    for k in drop_keys:
+      w.pop(k, None)
+
+    shard = os.path.join(hf_dir, "model-00001-of-00001.safetensors")
+    save_file(w, shard)
+    with open(os.path.join(hf_dir, "model.safetensors.index.json"), "w", encoding="utf8") as f:
+      json.dump({"metadata": {}, "weight_map": {k: os.path.basename(shard) for k in w}}, f)
+
+  def test_missing_keys_raise_runtimeerror(self):
+    try:
+      import torch  # noqa: F401
+      from safetensors.torch import save_file  # noqa: F401
+    except ImportError:
+      self.skipTest("torch / safetensors unavailable")
+    from maxtext.checkpoint_conversion.standalone_scripts import convert_minimax_m2
+
+    params = dict(num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                  hidden_size=16, head_dim=8, num_experts=4, moe_intermediate_size=12, vocab_size=32)
+    with tempfile.TemporaryDirectory() as tmp:
+      self._write_minimal_layout(tmp, params, drop_keys=[
+          "model.layers.0.block_sparse_moe.experts.3.w2.weight",
+      ])
+      with self.assertRaisesRegex(RuntimeError, "missing 1 expected weights"):
+        convert_minimax_m2.convert_hf_to_maxtext(tmp, params)
+
+  def test_missing_shard_file_raises(self):
+    try:
+      import torch  # noqa: F401
+      from safetensors.torch import save_file  # noqa: F401
+    except ImportError:
+      self.skipTest("torch / safetensors unavailable")
+    from maxtext.checkpoint_conversion.standalone_scripts import convert_minimax_m2
+
+    params = dict(num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                  hidden_size=16, head_dim=8, num_experts=4, moe_intermediate_size=12, vocab_size=32)
+    with tempfile.TemporaryDirectory() as tmp:
+      self._write_minimal_layout(tmp, params)
+      # Rewrite the index to reference a shard that doesn't exist on disk.
+      idx_path = os.path.join(tmp, "model.safetensors.index.json")
+      with open(idx_path, "r", encoding="utf8") as f:
+        idx = json.load(f)
+      idx["weight_map"]["lm_head.weight"] = "missing-shard.safetensors"
+      with open(idx_path, "w", encoding="utf8") as f:
+        json.dump(idx, f)
+      with self.assertRaisesRegex(RuntimeError, "missing safetensors shard"):
+        convert_minimax_m2.convert_hf_to_maxtext(tmp, params)
+
+
 class MiniMaxM2DecodeCLIArgsTest(unittest.TestCase):
   """Run the exact arg sets from scripts/minimax_m2.7/decode_{v5e,v6e}.sh through
   pyconfig.initialize and assert they validate. Catches the "decode script
