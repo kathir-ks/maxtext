@@ -491,9 +491,12 @@ class Attention(nnx.Module):
     is_llama4_decoder_block = self.config.decoder_block == DecoderBlockType.LLAMA4
 
     if self.use_qk_norm and not is_llama4_decoder_block:
-      # Check if this is Olmo3, which uses a unique "Global" QK Norm strategy.
-      # GlobalRMSNorm flattens (Heads, Dim) to normalize across the entire hidden state.
-      use_global_qk_norm = self.config.model_name.startswith("olmo3")
+      # Olmo3 and MiniMax-M2 use a "Global" QK Norm: a single RMSNorm whose scale
+      # spans all heads (num_heads * head_dim). GlobalRMSNorm flattens (Heads, Dim)
+      # to normalize across the entire hidden state.
+      use_global_qk_norm = self.config.model_name.startswith("olmo3") or (
+          self.config.decoder_block == DecoderBlockType.MINIMAX_M2
+      )
       qk_norm_cls = GlobalRMSNorm if use_global_qk_norm else RMSNorm
 
       # For RMSNorm use `head_dim` (per-head normalization), while for GlobalRMSNorm use `num_heads * head_dim` (global normalization).
