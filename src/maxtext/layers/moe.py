@@ -1192,10 +1192,10 @@ class RoutedMoE(nnx.Module):
         wo_bias_pspec = self._logical_to_mesh_axes(("exp", "activation_embed"))
 
       gate_logits_pspec = self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", None))
-      if self.config.model_name.startswith("deepseek3"):
+      if self.config.model_name.startswith("deepseek3") or self.config.decoder_block == ctypes.DecoderBlockType.MINIMAX_M2:
         pre_bias_logits_pspec = self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", None))
       else:
-        # pre_bias_logits is None for non-DeepSeek v3 models
+        # pre_bias_logits is None outside the bias-aware pre-bias routing path.
         pre_bias_logits_pspec = None
 
       # w0, w1, wo needs to be un sharded on fsdp / fsdp_transpose axis, so use
@@ -1566,7 +1566,7 @@ class RoutedMoE(nnx.Module):
       input_axes = (batch_logical_axis, "activation_norm_length", None)
 
     gate_logits_axes = (batch_logical_axis, "activation_norm_length", None)
-    if self.config.model_name.startswith("deepseek3"):
+    if self.config.model_name.startswith("deepseek3") or self.config.decoder_block == ctypes.DecoderBlockType.MINIMAX_M2:
       pre_bias_logits_axes = (batch_logical_axis, "activation_norm_length", None)
     else:
       pre_bias_logits_axes = None

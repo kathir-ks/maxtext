@@ -119,9 +119,31 @@ hosts.
 * MaxText scanned checkpoint (BF16 on disk via Orbax): ~460 GB
 
 The numpy float16 footprint of the entire scanned tree is the dominant
-cost. For VMs with less RAM, run the conversion against a same-region
-GCS bucket as `--maxtext_model_path` so Orbax streams output to GCS as
-it shards.
+cost. The converter currently pre-allocates one giant zero array per
+weight type (matching the existing `convert_qwen3_moe.py` pattern), so
+it cannot stream — pick a conversion host with enough RAM.
+
+| TPU host class | Approx host RAM | Fits conversion? |
+|---|---|---|
+| v5e single host | ~64 GB | No |
+| v6e-1 | ~64 GB | No |
+| v6e-8 | ~512 GB | Tight; works if no other big tenants |
+| v6e-16 / v6e-64 (per host) | ~1024 GB | Yes |
+
+Fallbacks if you can't get a 500+ GB host:
+1. point `--maxtext_model_path` at a **same-region** GCS bucket so
+   Orbax streams the output as it shards, then point `decode_*.sh`
+   at the bucket. This adds an in-region round-trip but stays inside
+   the no-cross-region-egress constraint.
+2. ship the FP8 weights as-is (no conversion) and convert in chunks
+   per-layer — TODO, not implemented yet.
+
+## Tokenizer notes
+
+MiniMax-M2's `tokenizer_config.json` declares no `pad_token`.
+MaxText's inference engine (`maxengine.py`) handles this by falling
+back to `unk_token_id`, then `eos_token_id`, so batched decode still
+works. You will see a one-line warning in the log; that's expected.
 
 ## File map
 
