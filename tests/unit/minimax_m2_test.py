@@ -616,5 +616,66 @@ class MiniMaxM2FP8DequantTest(unittest.TestCase):
     self.assertLess(float(rel_err), 0.10, f"rel_err = {float(rel_err):.4f}")
 
 
+class MiniMaxM2DecodeCLIArgsTest(unittest.TestCase):
+  """Run the exact arg sets from scripts/minimax_m2.7/decode_{v5e,v6e}.sh through
+  pyconfig.initialize and assert they validate. Catches the "decode script
+  crashes before any TPU work" failure mode on CPU.
+  """
+
+  def _decode_args(self, ici_tensor, ici_expert, batch, ctx_len):
+    return [
+        "model_name=minimax-m2.7",
+        # We won't load weights or call AutoTokenizer here, but pyconfig still
+        # wants a valid-looking tokenizer_path string; use the bundled fixture.
+        "tokenizer_path=assets/tokenizer.llama2",
+        "tokenizer_type=huggingface",
+        "load_parameters_path=/tmp/does-not-have-to-exist/0/items",
+        "run_name=decode-args-validation",
+        f"per_device_batch_size={batch}",
+        f"max_target_length={ctx_len}",
+        f"max_prefill_predict_length={ctx_len // 2}",
+        f"ici_tensor_parallelism={ici_tensor}",
+        f"ici_expert_parallelism={ici_expert}",
+        "ici_fsdp_parallelism=1",
+        "scan_layers=true",
+        "quantization=",
+        "weight_dtype=bfloat16",
+        "attention=dot_product",
+        "prompt=The capital of France is",
+        # enable_checkpointing must stay True when load_parameters_path is set.
+    ]
+
+  def test_decode_v5e_args_validate(self):
+    from maxtext.configs import pyconfig
+    from maxtext.utils.globals import MAXTEXT_REPO_ROOT
+
+    base = os.path.join(MAXTEXT_REPO_ROOT, "src", "maxtext", "configs", "base.yml")
+    # Default decode_v5e.sh: ICI_TENSOR=16, ICI_EXPERT=1, BATCH=1, MAX_TARGET_LENGTH=2048.
+    args = ["maxtext", base] + self._decode_args(16, 1, 1, 2048)
+    raw = pyconfig.initialize(args)
+    c = raw.config if hasattr(raw, "config") else raw
+    self.assertEqual(c.decoder_block.value, "minimax_m2")
+    self.assertEqual(c.ici_tensor_parallelism, 16)
+    self.assertEqual(c.ici_expert_parallelism, 1)
+    self.assertEqual(c.max_target_length, 2048)
+    self.assertEqual(c.attention.lower(), "dot_product")
+
+  def test_decode_v6e_args_validate(self):
+    from maxtext.configs import pyconfig
+    from maxtext.utils.globals import MAXTEXT_REPO_ROOT
+
+    base = os.path.join(MAXTEXT_REPO_ROOT, "src", "maxtext", "configs", "base.yml")
+    # Default decode_v6e.sh: ICI_TENSOR=8, ICI_EXPERT=8, BATCH=4, MAX_TARGET_LENGTH=8192.
+    args = ["maxtext", base] + self._decode_args(8, 8, 4, 8192)
+    raw = pyconfig.initialize(args)
+    c = raw.config if hasattr(raw, "config") else raw
+    self.assertEqual(c.ici_tensor_parallelism, 8)
+    self.assertEqual(c.ici_expert_parallelism, 8)
+    self.assertEqual(c.max_target_length, 8192)
+    # Inference at bf16 with the full MoE configuration: sanity check that
+    # pyconfig auto-fills the dependent fields rather than complaining.
+    self.assertEqual(c.weight_dtype, "bfloat16")
+
+
 if __name__ == "__main__":
   unittest.main()
