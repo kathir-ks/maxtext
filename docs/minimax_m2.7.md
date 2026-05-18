@@ -138,6 +138,41 @@ Fallbacks if you can't get a 500+ GB host:
 2. ship the FP8 weights as-is (no conversion) and convert in chunks
    per-layer — TODO, not implemented yet.
 
+## TPU slice sizing for inference
+
+The model footprint dominates HBM. Approximate weight sizes for the
+230 B-parameter MiniMax-M2.7:
+
+| Precision | Total weights | Per-chip min (v5e, 16 GB) | Per-chip min (v6e, 32 GB) |
+|---|---|---|---|
+| BF16 | ~460 GB | ≥ 32 chips | ≥ 16 chips |
+| INT8 | ~230 GB | ≥ 16 chips | ≥ 8 chips |
+| INT4 | ~115 GB | ≥ 8 chips | ≥ 4 chips |
+
+Recommended minimum slices (leaves headroom for KV cache, activations,
+and runtime allocator overhead):
+
+| Slice | Total HBM | OK for BF16? | OK for INT8? | OK for INT4? |
+|---|---|---|---|---|
+| v5e-16 | 256 GB | no | tight | yes |
+| v5e-64 | 1024 GB | yes | yes | yes |
+| v6e-8 | 256 GB | no | tight | yes |
+| v6e-16 | 512 GB | tight | yes | yes |
+| v6e-64 | 2048 GB | yes | yes | yes |
+
+Caveat: MaxText's `quantization=int8` is post-load dynamic
+quantization — the BF16 weights are materialized first and only
+then quantized. So even if the *runtime* fits in int8, the **load
+step** still needs BF16 headroom. To run on smaller slices you
+either need a pre-quantized checkpoint or you need to widen the
+slice for the load and re-shard. See
+`feedback_no_local_conversion` in project memory for the
+in-region-conversion pattern that avoids cross-region egress.
+
+`scripts/minimax_m2.7/decode_v5e.sh` and `decode_v6e.sh` default to
+`weight_dtype=bfloat16` and `quantization=` (none). Override with
+`BATCH=` and `ICI_*` env vars to match your actual slice.
+
 ## Tokenizer notes
 
 MiniMax-M2's `tokenizer_config.json` declares no `pad_token`.
