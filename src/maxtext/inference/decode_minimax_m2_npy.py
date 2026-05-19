@@ -52,37 +52,81 @@ def _flat_to_nested(flat):
   return out
 
 
-def build_params(npy_dir: pathlib.Path, param_shardings) -> dict:
-  """Return a MaxText-shaped pytree where every leaf is a globally-sharded jax.Array."""
-  with open(npy_dir / "manifest.json", "rt") as f:
-    manifest = json.load(f)
+def _detect_distributed(npy_dir: pathlib.Path) -> bool:
+  return any(npy_dir.glob("manifest.p*.json"))
 
-  flat_shardings = _nested_to_flat(jax.tree.map(lambda x: x, param_shardings))
 
-  # MaxText flows typically nest params under a top-level "params" subkey
-  # (Linen "params" collection). Detect that and remember it so we can
-  # mirror it on the way out.
-  wrap_under_params = all(k.startswith("params.") for k in flat_shardings)
-  if wrap_under_params:
-    flat_shardings = {k[len("params."):]: v for k, v in flat_shardings.items()}
-
+def _build_replicated(npy_dir, manifest, flat_shardings) -> dict:
   built = {}
   for leaf_name, meta in manifest["params"].items():
     sharding = flat_shardings.get(leaf_name)
     if sharding is None:
-      max_logging.log(f"WARNING: manifest leaf {leaf_name!r} has no matching engine sharding; skipping")
+      max_logging.log(f"WARN: leaf {leaf_name!r} has no engine sharding; skipping")
       continue
     shape = tuple(meta["shape"])
     dtype = jnp.dtype(meta["dtype"])
-
     path = npy_dir / f"{leaf_name}.npy"
     mm = np.load(str(path), mmap_mode="r")
     assert mm.shape == shape, f"{leaf_name}: manifest shape {shape} vs file {mm.shape}"
-
     def cb(index, _mm=mm, _dtype=dtype):
       return np.asarray(_mm[index]).astype(_dtype)
-
     built[leaf_name] = jax.make_array_from_callback(shape, sharding, cb)
+  return built
+
+
+def _build_distributed(npy_dir, flat_shardings) -> dict:
+  """Build params from per-(process, local_device) shards written by
+  ``convert_minimax_m2_distributed``."""
+  proc_idx = jax.process_index()
+  local_devs = list(jax.local_devices())
+  manifest_path = npy_dir / f"manifest.p{proc_idx}.json"
+  if not manifest_path.exists():
+    raise FileNotFoundError(f"no per-host manifest at {manifest_path}")
+  with open(manifest_path, "rt") as f:
+    manifest = json.load(f)
+
+  global_shapes = {k: tuple(v) for k, v in manifest["global_shapes"].items()}
+  global_dtype = jnp.dtype(manifest["global_dtype"])
+
+  # Group shards by leaf and local device index.
+  shards_by_leaf: dict = {}  # leaf -> {local_device_index: shard_meta}
+  for shard_meta in manifest["shards"].values():
+    shards_by_leaf.setdefault(shard_meta["leaf"], {})[shard_meta["local_device_index"]] = shard_meta
+
+  built = {}
+  for leaf_name, sharding in flat_shardings.items():
+    if leaf_name not in shards_by_leaf:
+      max_logging.log(f"WARN: leaf {leaf_name!r} missing from host manifest; skipping")
+      continue
+    global_shape = global_shapes[leaf_name]
+    # Build a list of per-local-device jax.Arrays, ordered by local_devices().
+    local_arrays = []
+    for d_idx, dev in enumerate(local_devs):
+      meta = shards_by_leaf[leaf_name][d_idx]
+      path = npy_dir / f"{leaf_name}.p{proc_idx}.d{d_idx}.npy"
+      mm = np.load(str(path), mmap_mode="r")
+      arr = jax.device_put(np.asarray(mm).astype(global_dtype), dev)
+      local_arrays.append(arr)
+    built[leaf_name] = jax.make_array_from_single_device_arrays(
+        global_shape, sharding, local_arrays)
+  return built
+
+
+def build_params(npy_dir: pathlib.Path, param_shardings) -> dict:
+  """Return a MaxText-shaped pytree where every leaf is a globally-sharded jax.Array."""
+  flat_shardings = _nested_to_flat(jax.tree.map(lambda x: x, param_shardings))
+  wrap_under_params = all(k.startswith("params.") for k in flat_shardings)
+  if wrap_under_params:
+    flat_shardings = {k[len("params."):]: v for k, v in flat_shardings.items()}
+
+  if _detect_distributed(npy_dir):
+    max_logging.log(f"loading distributed manifest from {npy_dir}")
+    built = _build_distributed(npy_dir, flat_shardings)
+  else:
+    with open(npy_dir / "manifest.json", "rt") as f:
+      manifest = json.load(f)
+    max_logging.log(f"loading replicated manifest from {npy_dir}")
+    built = _build_replicated(npy_dir, manifest, flat_shardings)
 
   nested = _flat_to_nested(built)
   if wrap_under_params:
