@@ -120,9 +120,12 @@ def _file_is_safe_to_unlink(layers_in_file: Set[int], current_layer: int) -> boo
 def leaf_shapes(p: dict) -> Dict[str, Tuple[Tuple[int, ...], str, str]]:
   """Map MaxText leaf path -> (shape, np_dtype, sharding-axis label).
 
-  Layer-stride axis is always the FIRST axis except for the MoE expert
-  tensors, where layers is the SECOND axis (preserves the existing
-  convert_minimax_m2.py layout). Sharding-axis label is informational.
+  Shapes match MaxText's *post-transpose* scanned layout (see the final
+  np.transpose pass at the bottom of convert_hf_to_maxtext in
+  convert_minimax_m2.py): the layer axis lives at position 1 for every
+  per-layer leaf, NOT position 0. The MaxText TP sharding annotations
+  shard the non-layer hidden axis, so this is the layout the engine
+  actually expects.
   """
   L, H = p["num_hidden_layers"], p["hidden_size"]
   Hq, Hkv, D = p["num_attention_heads"], p["num_key_value_heads"], p["head_dim"]
@@ -133,18 +136,18 @@ def leaf_shapes(p: dict) -> Dict[str, Tuple[Tuple[int, ...], str, str]]:
       "token_embedder.embedding": ((V, H), "float16", "vocab"),
       "decoder.decoder_norm.scale": ((H,), "float16", "hidden"),
       "decoder.logits_dense.kernel": ((H, V), "float16", "vocab"),
-      # ----- per-layer norm / attention -----
-      "decoder.layers.pre_self_attention_layer_norm.scale": ((L, H), "float16", "layer-hidden"),
-      "decoder.layers.post_self_attention_layer_norm.scale": ((L, H), "float16", "layer-hidden"),
-      "decoder.layers.self_attention.query.kernel": ((L, H, Hq, D), "float16", "layer-q"),
-      "decoder.layers.self_attention.key.kernel": ((L, H, Hkv, D), "float16", "layer-kv"),
-      "decoder.layers.self_attention.value.kernel": ((L, H, Hkv, D), "float16", "layer-kv"),
-      "decoder.layers.self_attention.out.kernel": ((L, Hq, D, H), "float16", "layer-o"),
-      "decoder.layers.self_attention.query_norm.scale": ((L, Hq * D), "float16", "layer-q"),
-      "decoder.layers.self_attention.key_norm.scale": ((L, Hkv * D), "float16", "layer-kv"),
-      # ----- per-layer MoE (layer is axis 0 for gate; axis 1 for experts) -----
-      "decoder.layers.moe_block.gate.kernel": ((L, H, E), "float16", "layer-experts"),
-      "decoder.layers.moe_block.gate.bias": ((L, E), "float16", "layer-experts"),
+      # ----- per-layer norm / attention (layer axis = position 1) -----
+      "decoder.layers.pre_self_attention_layer_norm.scale": ((H, L), "float16", "hidden-layer"),
+      "decoder.layers.post_self_attention_layer_norm.scale": ((H, L), "float16", "hidden-layer"),
+      "decoder.layers.self_attention.query.kernel": ((H, L, Hq, D), "float16", "hidden-layer-q"),
+      "decoder.layers.self_attention.key.kernel": ((H, L, Hkv, D), "float16", "hidden-layer-kv"),
+      "decoder.layers.self_attention.value.kernel": ((H, L, Hkv, D), "float16", "hidden-layer-kv"),
+      "decoder.layers.self_attention.out.kernel": ((Hq, L, D, H), "float16", "q-layer-d-hidden"),
+      "decoder.layers.self_attention.query_norm.scale": ((Hq * D, L), "float16", "q-layer"),
+      "decoder.layers.self_attention.key_norm.scale": ((Hkv * D, L), "float16", "kv-layer"),
+      # ----- per-layer MoE (gate kernel: (H, L, E); gate bias: (E, L); experts: (E, L, ...)) -----
+      "decoder.layers.moe_block.gate.kernel": ((H, L, E), "float16", "hidden-layer-experts"),
+      "decoder.layers.moe_block.gate.bias": ((E, L), "float16", "experts-layer"),
       "decoder.layers.moe_block.wi_0": ((E, L, H, F), "float16", "experts-layer"),
       "decoder.layers.moe_block.wi_1": ((E, L, H, F), "float16", "experts-layer"),
       "decoder.layers.moe_block.wo": ((E, L, F, H), "float16", "experts-layer"),
@@ -228,30 +231,33 @@ def main(args):
   arrs["decoder.logits_dense.kernel"][:] = _np_from_torch(fetch("lm_head.weight").T)
 
   for l in tqdm(range(num_layers), desc="Layers"):
-    arrs["decoder.layers.pre_self_attention_layer_norm.scale"][l] = _np_from_torch(
+    # Norms — layer is axis 1.
+    arrs["decoder.layers.pre_self_attention_layer_norm.scale"][:, l] = _np_from_torch(
         fetch(f"model.layers.{l}.input_layernorm.weight"))
-    arrs["decoder.layers.post_self_attention_layer_norm.scale"][l] = _np_from_torch(
+    arrs["decoder.layers.post_self_attention_layer_norm.scale"][:, l] = _np_from_torch(
         fetch(f"model.layers.{l}.post_attention_layernorm.weight"))
 
-    # Attention projections — HF (out, in); MaxText (in, n_heads, head_dim).
-    arrs["decoder.layers.self_attention.query.kernel"][l] = _np_from_torch(
+    # Attention projections — HF (out, in); MaxText (H, L, n_heads, head_dim) etc.
+    arrs["decoder.layers.self_attention.query.kernel"][:, l, :, :] = _np_from_torch(
         fetch(f"model.layers.{l}.self_attn.q_proj.weight").T.reshape(H, Hq, D))
-    arrs["decoder.layers.self_attention.key.kernel"][l] = _np_from_torch(
+    arrs["decoder.layers.self_attention.key.kernel"][:, l, :, :] = _np_from_torch(
         fetch(f"model.layers.{l}.self_attn.k_proj.weight").T.reshape(H, Hkv, D))
-    arrs["decoder.layers.self_attention.value.kernel"][l] = _np_from_torch(
+    arrs["decoder.layers.self_attention.value.kernel"][:, l, :, :] = _np_from_torch(
         fetch(f"model.layers.{l}.self_attn.v_proj.weight").T.reshape(H, Hkv, D))
-    arrs["decoder.layers.self_attention.out.kernel"][l] = _np_from_torch(
+    arrs["decoder.layers.self_attention.out.kernel"][:, l, :, :] = _np_from_torch(
         fetch(f"model.layers.{l}.self_attn.o_proj.weight").T.reshape(Hq, D, H))
-    arrs["decoder.layers.self_attention.query_norm.scale"][l] = _np_from_torch(
+    arrs["decoder.layers.self_attention.query_norm.scale"][:, l] = _np_from_torch(
         fetch(f"model.layers.{l}.self_attn.q_norm.weight"))
-    arrs["decoder.layers.self_attention.key_norm.scale"][l] = _np_from_torch(
+    arrs["decoder.layers.self_attention.key_norm.scale"][:, l] = _np_from_torch(
         fetch(f"model.layers.{l}.self_attn.k_norm.weight"))
 
-    arrs["decoder.layers.moe_block.gate.kernel"][l] = _np_from_torch(
+    # MoE gate: kernel shape (H, L, E); bias shape (E, L).
+    arrs["decoder.layers.moe_block.gate.kernel"][:, l, :] = _np_from_torch(
         fetch(f"model.layers.{l}.block_sparse_moe.gate.weight").T)
-    arrs["decoder.layers.moe_block.gate.bias"][l] = _np_from_torch(
+    arrs["decoder.layers.moe_block.gate.bias"][:, l] = _np_from_torch(
         fetch(f"model.layers.{l}.block_sparse_moe.e_score_correction_bias"))
 
+    # MoE experts: (E, L, ...) — layer is already at axis 1.
     for e in range(num_experts):
       arrs["decoder.layers.moe_block.wi_0"][e, l] = _np_from_torch(
           fetch(f"model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight").T)
