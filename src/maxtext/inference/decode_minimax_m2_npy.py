@@ -202,8 +202,10 @@ def main():
     return
 
   npy_dir = pathlib.Path(args.npy_dir).expanduser().resolve()
-  if not (npy_dir / "manifest.json").exists():
-    raise SystemExit(f"no manifest.json found under {npy_dir}")
+  has_replicated = (npy_dir / "manifest.json").exists()
+  has_distributed = any(npy_dir.glob("manifest.p*.json"))
+  if not (has_replicated or has_distributed):
+    raise SystemExit(f"no manifest.json or manifest.p*.json found under {npy_dir}")
 
   install_load_params_patch(npy_dir)
 
