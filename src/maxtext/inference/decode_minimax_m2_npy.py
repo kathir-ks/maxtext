@@ -59,8 +59,11 @@ def build_params(npy_dir: pathlib.Path, param_shardings) -> dict:
 
   flat_shardings = _nested_to_flat(jax.tree.map(lambda x: x, param_shardings))
 
-  # Some MaxText flows nest params under a "params" subkey; tolerate either layout.
-  if all(k.startswith("params.") for k in flat_shardings):
+  # MaxText flows typically nest params under a top-level "params" subkey
+  # (Linen "params" collection). Detect that and remember it so we can
+  # mirror it on the way out.
+  wrap_under_params = all(k.startswith("params.") for k in flat_shardings)
+  if wrap_under_params:
     flat_shardings = {k[len("params."):]: v for k, v in flat_shardings.items()}
 
   built = {}
@@ -81,7 +84,10 @@ def build_params(npy_dir: pathlib.Path, param_shardings) -> dict:
 
     built[leaf_name] = jax.make_array_from_callback(shape, sharding, cb)
 
-  return _flat_to_nested(built)
+  nested = _flat_to_nested(built)
+  if wrap_under_params:
+    nested = {"params": nested}
+  return nested
 
 
 def install_load_params_patch(npy_dir: pathlib.Path) -> None:
