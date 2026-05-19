@@ -147,6 +147,24 @@ def _nested_to_flat(tree, prefix=""):
   return out
 
 
+def _normalize_idx(idx: Tuple, global_shape: Tuple[int, ...]) -> Tuple[slice, ...]:
+  """Replace any slice(None) entries with concrete bounds from global_shape.
+
+  ``Sharding.addressable_devices_indices_map`` returns ``slice(None, None, None)``
+  for axes that are fully replicated across the mesh. Downstream code wants
+  concrete ``[start, stop)`` for size arithmetic; this normalizes them.
+  """
+  out = []
+  for s, dim in zip(idx, global_shape):
+    if not isinstance(s, slice):
+      out.append(slice(int(s), int(s) + 1))
+      continue
+    start, stop, step = s.indices(dim)
+    assert step == 1, f"non-unit slice step not supported: {s}"
+    out.append(slice(start, stop))
+  return tuple(out)
+
+
 def _local_shape_from_idx(idx: Tuple) -> Tuple[int, ...]:
   return tuple(s.stop - s.start for s in idx)
 
@@ -250,7 +268,7 @@ def main(args):
     sharding = flat[leaf]
     addr = sharding.addressable_devices_indices_map(global_shape)
     for dev, idx in addr.items():
-      per_dev_slices[(leaf, local_devs.index(dev))] = idx
+      per_dev_slices[(leaf, local_devs.index(dev))] = _normalize_idx(idx, global_shape)
 
   # 3) Compute this host's expert range from the MoE shardings.
   expert_ranges = []
