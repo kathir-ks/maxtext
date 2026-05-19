@@ -316,14 +316,36 @@ def main(args):
   all_files = sorted(set(weight_map.values()))
   log(f"need {len(needed_files)} of {len(all_files)} HF files")
 
-  if not args.skip_download:
-    from huggingface_hub import hf_hub_download
-    t0 = time.time()
-    missing = [fn for fn in needed_files if not (hf_dir / fn).exists()]
-    log(f"downloading {len(missing)} missing files (skipping {len(needed_files) - len(missing)} present)")
-    for fn in tqdm(missing, desc="hf_dl"):
-      hf_hub_download(repo_id=args.repo_id, filename=fn, local_dir=str(hf_dir))
-    log(f"download done in {time.time()-t0:.1f}s")
+  # Compute file lifecycle: for each needed file, the set of layer indices
+  # whose tensors live in it. -1 means "shared / non-layer".
+  file_layers: Dict[str, Set[int]] = {}
+  for tname in needed:
+    if tname not in weight_map:
+      continue
+    fname = weight_map[tname]
+    if tname.startswith("model.layers."):
+      L_idx = int(tname.split(".")[2])
+      file_layers.setdefault(fname, set()).add(L_idx)
+    else:
+      file_layers.setdefault(fname, set()).add(-1)
+  first_layer = {fn: (min(ls) if min(ls) >= 0 else -1) for fn, ls in file_layers.items()}
+  last_layer = {fn: (max(ls) if max(ls) >= 0 else -1) for fn, ls in file_layers.items()}
+
+  from huggingface_hub import hf_hub_download
+
+  def ensure_file(fn: str) -> None:
+    if (hf_dir / fn).exists():
+      return
+    hf_hub_download(repo_id=args.repo_id, filename=fn, local_dir=str(hf_dir))
+
+  def drop_file(fn: str, handle_cache: Dict) -> None:
+    if fn in handle_cache:
+      del handle_cache[fn]
+    p = hf_dir / fn
+    try:
+      p.unlink()
+    except OSError:
+      pass
 
   # 5) Open per-device memmaps for all leaves.
   out_dir = pathlib.Path(args.output_dir)
@@ -343,7 +365,13 @@ def main(args):
   def fetch(name):
     return _get_tensor_bf16(weight_map, str(hf_dir), name, handle_cache)
 
-  log("writing non-layered leaves (embed / final norm / lm_head)")
+  log("downloading + writing non-layered leaves (embed / final norm / lm_head)")
+  for tname in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"):
+    ensure_file(weight_map[tname])
+    scale = f"{tname}_scale_inv"
+    if scale in weight_map:
+      ensure_file(weight_map[scale])
+
   emb = _np_from_torch(fetch("model.embed_tokens.weight"))
   write_replicated(arrs, per_dev_slices, "token_embedder.embedding", emb, local_devs)
   del emb
@@ -356,11 +384,43 @@ def main(args):
   write_replicated(arrs, per_dev_slices, "decoder.logits_dense.kernel", lmh, local_devs)
   del lmh
 
+  # Drop any files whose only purpose was shared tensors (last_layer == -1).
+  for fn in list(file_layers):
+    if max(file_layers[fn]) == -1:
+      drop_file(fn, handle_cache)
+
   H = p["hidden_size"]
   Hq, Hkv, D = p["num_attention_heads"], p["num_key_value_heads"], p["head_dim"]
 
-  log("writing per-layer leaves")
+  log("writing per-layer leaves with just-in-time HF download")
   for L in tqdm(range(p["num_hidden_layers"]), desc="layers"):
+    # Download every file whose first_layer == L (or earlier and not yet present).
+    layer_files: Set[str] = set()
+    for tname in [
+        f"model.layers.{L}.input_layernorm.weight",
+        f"model.layers.{L}.post_attention_layernorm.weight",
+        f"model.layers.{L}.self_attn.q_proj.weight",
+        f"model.layers.{L}.self_attn.k_proj.weight",
+        f"model.layers.{L}.self_attn.v_proj.weight",
+        f"model.layers.{L}.self_attn.o_proj.weight",
+        f"model.layers.{L}.self_attn.q_norm.weight",
+        f"model.layers.{L}.self_attn.k_norm.weight",
+        f"model.layers.{L}.block_sparse_moe.gate.weight",
+        f"model.layers.{L}.block_sparse_moe.e_score_correction_bias",
+    ]:
+      if tname in weight_map:
+        layer_files.add(weight_map[tname])
+    for e in range(host_expert_lo, host_expert_hi):
+      for tail in ("w1", "w2", "w3"):
+        tname = f"model.layers.{L}.block_sparse_moe.experts.{e}.{tail}.weight"
+        if tname in weight_map:
+          layer_files.add(weight_map[tname])
+    # Include scale_inv files too
+    for fn in list(layer_files):
+      pass  # scale_inv is in the same file as its tensor for FP8 layouts
+    for fn in sorted(layer_files):
+      ensure_file(fn)
+
     write_layer_slice(arrs, per_dev_slices,
         "decoder.layers.pre_self_attention_layer_norm.scale", L,
         _np_from_torch(fetch(f"model.layers.{L}.input_layernorm.weight")), local_devs)
@@ -423,6 +483,12 @@ def main(args):
           arrs[(leaf, d)][le, ll, :, :] = src[a_slc, b_slc]
       del w1, w2, w3
 
+    # Drop files whose last_layer == L (no future layer needs them).
+    for fn in list(file_layers):
+      if last_layer[fn] != -1 and last_layer[fn] <= L:
+        if (hf_dir / fn).exists():
+          drop_file(fn, handle_cache)
+    # Always release handle cache so the unlinked files don't hold dtmpfs pages.
     handle_cache.clear()
     gc.collect()
 
