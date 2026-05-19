@@ -311,6 +311,24 @@ def main(args):
   model_params = MODEL_PARAMS_DICT[args.model_size]
   max_logging.log(f"Converting MiniMax model: {args.model_size}")
   jax_weights = convert_hf_to_maxtext(args.base_model_path, model_params)
+
+  # Free FP8 source between conversion and save. The numpy tree is now fully
+  # built; safetensors mmaps are still valid as long as Python holds them,
+  # but unlinking the files frees the dtmpfs blocks they occupy. Only deletes
+  # *.safetensors — config and tokenizer files are preserved.
+  if os.environ.get("MINIMAX_FREE_FP8_BEFORE_SAVE") == "1":
+    import glob
+    freed = 0
+    for p in glob.glob(os.path.join(args.base_model_path, "*.safetensors")):
+      try:
+        freed += os.path.getsize(p)
+        os.unlink(p)
+      except OSError:
+        pass
+    max_logging.log(
+        f"Freed {freed/1e9:.1f} GB of FP8 safetensors from {args.base_model_path}")
+    gc.collect()
+
   max_logging.log(f"Saving MaxText checkpoint to {args.maxtext_model_path}")
   llama_or_mistral_ckpt.save_weights_to_checkpoint(
       args.maxtext_model_path,
