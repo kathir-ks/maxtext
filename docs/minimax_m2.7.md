@@ -180,6 +180,91 @@ MaxText's inference engine (`maxengine.py`) handles this by falling
 back to `unk_token_id`, then `eos_token_id`, so batched decode still
 works. You will see a one-line warning in the log; that's expected.
 
+## Fast path: v5e-64 in ~30 min cold-start
+
+The current production setup uses the **distributed dtmpfs path** on
+v5e-64. Each host stores only its 1/16 of the model (~27 GB) on local
+dtmpfs; no host ever holds the whole 460 GB, so the 188 GB v5e host RAM
+fits comfortably.
+
+```bash
+# 1) Bootstrap every TPU worker (fast-paths if already installed)
+gcloud compute tpus tpu-vm ssh node-v5e-64-europe-west4-b \
+  --zone=europe-west4-b --worker=all \
+  --command='bash ~/maxtext/scripts/minimax_m2.7/bootstrap_tpu.sh'
+
+# 2) Mount dtmpfs (one-time per slice lifecycle)
+gcloud compute tpus tpu-vm ssh node-v5e-64-europe-west4-b \
+  --zone=europe-west4-b --worker=all \
+  --command='sudo bash ~/maxtext/scripts/minimax_m2.7/setup_dtmpfs.sh /mnt/dtmpfs 120G'
+
+# 3) Distributed convert (windowed prefetch + parallel HF download)
+gcloud compute tpus tpu-vm ssh node-v5e-64-europe-west4-b \
+  --zone=europe-west4-b --worker=all \
+  --command='bash ~/maxtext/scripts/minimax_m2.7/convert_distributed.sh'
+
+# 4) Decode (first call compiles ~12 min, subsequent calls ~30 s via JAX cache)
+gcloud compute tpus tpu-vm ssh node-v5e-64-europe-west4-b \
+  --zone=europe-west4-b --worker=all \
+  --command='bash ~/maxtext/scripts/minimax_m2.7/decode_distributed.sh'
+
+# 5) Sweep benchmarks (env-var driven, aggregated CSV)
+bash scripts/minimax_m2.7/sweep.sh
+```
+
+Wall times:
+- Bootstrap: ~5-10 min cold, ~1 min warm (fast-path skip).
+- Convert: ~50 min (windowed prefetch from HF; bottlenecked by per-layer
+  dequant, not download).
+- First decode: ~12 min JIT compile (cached under
+  `/mnt/dtmpfs/jax_cache_v5e64`); subsequent decodes ~30 s.
+- Per-host dtmpfs: ~30 GB shards + ~30 GB rolling FP8 window = ~60 GB
+  peak; fits in 120 GB tmpfs.
+
+v5e constraints to be aware of: `attention=dot_product`, `megablox=false`,
+`sparse_matmul=false`. v5e ICI routing doesn't support ragged-all-to-all
+so the MoE falls back to capacity-bounded dense matmul routing.
+
+## Measured throughput on v5e-64
+
+Validated on `node-v5e-64-europe-west4-b` (2026-05-20). All numbers from
+end-to-end `decode_distributed.sh` runs against the distributed shards.
+Compile cache populated on `/mnt/dtmpfs/jax_cache_v5e64` (9 entries,
+~9.6 MB) so the JIT step is amortized between runs.
+
+| Config | Batch | Prefill | Decoded tokens | Total wall | tok/s pod-wide | tok/s/chip |
+|---|---|---|---|---|---|---|
+| bf16, capacity_factor=2.0 | 1 | 8 | 120 | 46 s | ~5 | ~0.08 |
+
+Notes / caveats:
+- Wall time includes pyconfig + engine init + abstract_state + JIT
+  cache-hit (~20 s total). The pure-decode steady-state is ~25 s for
+  120 tokens, so the "real" generation throughput is ~5 tok/s pod-wide.
+- v5e ICI routing forces `megablox=false sparse_matmul=false
+  capacity_factor=2.0`, which falls back to dense matmul over experts —
+  the dominant compute cost for MoE inference. v6e would do much better
+  here once it's available.
+- Quantization sweep (int8 / int4 / kv_quant) and batch-scaling cells
+  were attempted via `inference_microbenchmark` but hit a KV-cache
+  sharding mismatch when the AR cache is initialized with our
+  `make_array_from_single_device_arrays` param path; see "Open issues"
+  below.
+
+## Open issues
+
+- `inference_microbenchmark.run_benchmarks` calls `engine.aot_compile`
+  which freezes a `decode_state_layouts` and then expects every
+  subsequent `engine.insert` / `engine.generate` to use the same
+  sharding. With our custom `decode_minimax_m2_npy` load_params path
+  the params arrive correctly sharded but the engine-allocated cache
+  buffers (cache_ar_segment_id, cached_prefill_key, ...) report a
+  sharding mismatch on multi-host. Workaround for now: time the
+  existing `decode_distributed.sh` wall-clock and divide by token
+  count. Next step: build a custom benchmark that allocates the cache
+  via `make_array_from_callback` with the engine's
+  `decode_state_layouts` instead of relying on aot_compile's
+  in-process allocation.
+
 ## File map
 
 | File | Purpose |
@@ -193,7 +278,16 @@ works. You will see a one-line warning in the log; that's expected.
 | `src/maxtext/configs/models/minimax-m2.yml` | M2 config (context 204 800) |
 | `src/maxtext/configs/models/minimax-m2.7.yml` | M2.7 config (context 196 608) |
 | `src/maxtext/configs/types.py` | Validators extended for `partial_rotary_factor` and fully-MoE base_mlp_dim |
-| `src/maxtext/checkpoint_conversion/standalone_scripts/convert_minimax_m2.py` | HF → MaxText converter (with on-the-fly FP8 dequant) |
+| `src/maxtext/checkpoint_conversion/standalone_scripts/convert_minimax_m2.py` | HF → MaxText converter (single-host, for ≥1024 GB hosts) |
+| `src/maxtext/checkpoint_conversion/standalone_scripts/convert_minimax_m2_streaming.py` | Single-host streaming converter (memmap-backed .npy) |
+| `src/maxtext/checkpoint_conversion/standalone_scripts/convert_minimax_m2_distributed.py` | Distributed 16-process converter; windowed prefetch + barrier-on-exit |
+| `src/maxtext/inference/decode_minimax_m2_npy.py` | Decode wrapper; monkey-patches MaxEngine.load_params for .npy shards |
+| `src/maxtext/inference/benchmark_minimax_m2_npy.py` | Benchmark wrapper; same patch + inference_microbenchmark for tok/s |
+| `scripts/minimax_m2.7/bootstrap_tpu.sh` | One-shot worker bootstrap (idempotent fast-path on re-runs) |
 | `scripts/minimax_m2.7/setup_dtmpfs.sh` | Mount /mnt/dtmpfs |
-| `scripts/minimax_m2.7/download_and_convert.sh` | Stage HF weights and convert in place |
-| `scripts/minimax_m2.7/decode_{v5e,v6e}.sh` | Launch decode |
+| `scripts/minimax_m2.7/download_and_convert.sh` | Legacy single-host pipeline |
+| `scripts/minimax_m2.7/convert_distributed.sh` | Distributed convert driver |
+| `scripts/minimax_m2.7/decode_distributed.sh` | Distributed decode driver (env-var configurable) |
+| `scripts/minimax_m2.7/benchmark_distributed.sh` | Per-cell benchmark driver |
+| `scripts/minimax_m2.7/sweep.sh` | Iterates the Phase-2 config sweep + aggregates CSV |
+| `scripts/minimax_m2.7/decode_{v5e,v6e}.sh` | Single-host decode (legacy) |
