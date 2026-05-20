@@ -349,26 +349,54 @@ def main(args):
 
   from huggingface_hub import hf_hub_download, snapshot_download
 
-  # Parallel upfront fetch of every safetensors file this host will need.
-  # ~30 GB per host with `max_workers=8` saturates HF's CDN at ~1 GB/s
-  # instead of the sequential ~150 MB/s a single hf_hub_download achieves.
-  missing_data = [fn for fn in needed_files if not (hf_dir / fn).exists()]
-  if missing_data:
-    log(f"snapshot_download: {len(missing_data)} of {len(needed_files)} needed files missing")
+  # Bucket files by their first-needed layer so we can window-prefetch:
+  # download files for layers [L, L+window) in parallel, process, then
+  # delete them before fetching the next window. Caps dtmpfs at
+  # ~window * (~2 files/layer) * ~1.7 GB ≈ ~window * 3.4 GB.
+  files_by_first_layer: Dict[int, Set[str]] = {}
+  for fn in needed_files:
+    fl = first_layer.get(fn, -1)
+    files_by_first_layer.setdefault(fl, set()).add(fn)
+
+  window = max(1, args.prefetch_window)
+
+  def prefetch_window_for(layer_lo: int) -> None:
+    """Download every needed file whose first_layer ∈ [layer_lo, layer_lo + window)
+    that isn't already on dtmpfs. Uses snapshot_download with multiple workers
+    to saturate HF Hub's CDN."""
+    upcoming: Set[str] = set()
+    for L_lookup in range(layer_lo, min(layer_lo + window, p["num_hidden_layers"])):
+      upcoming |= files_by_first_layer.get(L_lookup, set())
+    # Files holding shared (non-layer) tensors live under first_layer == -1;
+    # we fetch those up front (before the layer loop) — see prefetch_shared().
+    missing = [fn for fn in upcoming if not (hf_dir / fn).exists()]
+    if not missing:
+      return
+    log(f"prefetch L={layer_lo}..{layer_lo+window-1}: {len(missing)} files")
     t0 = time.time()
     snapshot_download(
         repo_id=args.repo_id,
         local_dir=str(hf_dir),
-        allow_patterns=missing_data,
+        allow_patterns=missing,
         max_workers=args.hf_download_workers,
     )
-    log(f"snapshot_download done in {time.time() - t0:.1f}s")
-  else:
-    log("all needed safetensors already on dtmpfs; skipping snapshot_download")
+    log(f"prefetch L={layer_lo} done in {time.time() - t0:.1f}s")
+
+  def prefetch_shared() -> None:
+    """Fetch all files containing only shared (non-layer) tensors up front."""
+    shared = files_by_first_layer.get(-1, set())
+    missing = [fn for fn in shared if not (hf_dir / fn).exists()]
+    if not missing:
+      return
+    log(f"prefetch shared/non-layer: {len(missing)} files")
+    snapshot_download(
+        repo_id=args.repo_id,
+        local_dir=str(hf_dir),
+        allow_patterns=missing,
+        max_workers=args.hf_download_workers,
+    )
 
   def ensure_file(fn: str) -> None:
-    # Fallback in case a file got deleted prematurely by drop_file; the
-    # main download path is the upfront snapshot_download above.
     if (hf_dir / fn).exists():
       return
     hf_hub_download(repo_id=args.repo_id, filename=fn, local_dir=str(hf_dir))
@@ -381,6 +409,8 @@ def main(args):
       p.unlink()
     except OSError:
       pass
+
+  prefetch_shared()
 
   # 5) Open per-device memmaps for all leaves.
   out_dir = pathlib.Path(args.output_dir)
@@ -421,8 +451,12 @@ def main(args):
   H = p["hidden_size"]
   Hq, Hkv, D = p["num_attention_heads"], p["num_key_value_heads"], p["head_dim"]
 
-  log("writing per-layer leaves (all safetensors already on dtmpfs)")
+  log(f"writing per-layer leaves with windowed prefetch (window={window})")
   for L in tqdm(range(p["num_hidden_layers"]), desc="layers"):
+    # If this layer's start aligns with a fresh window, prefetch the window.
+    if L % window == 0:
+      prefetch_window_for(L)
+
     write_layer_slice(arrs, per_dev_slices,
         "decoder.layers.pre_self_attention_layer_norm.scale", L,
         _np_from_torch(fetch(f"model.layers.{L}.input_layernorm.weight")), local_devs)
@@ -531,5 +565,9 @@ if __name__ == "__main__":
   parser.add_argument("--hf_download_workers", type=int, default=8,
                       help="Parallel workers for snapshot_download (default 8). "
                            "Bound by your HF auth tier and host network.")
+  parser.add_argument("--prefetch_window", type=int, default=8,
+                      help="How many layers' worth of safetensors files to "
+                           "prefetch in parallel before processing them. "
+                           "Caps peak dtmpfs at ~window * 3.4 GB. Default 8.")
   parser.add_argument("--maxtext_args", nargs=argparse.REMAINDER, default=[])
   main(parser.parse_args())
