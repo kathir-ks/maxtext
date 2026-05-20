@@ -283,11 +283,27 @@ def main(args):
   # 4) Ensure HF index, then download only needed files.
   hf_dir = pathlib.Path(args.hf_dir)
   hf_dir.mkdir(parents=True, exist_ok=True)
-  if not (hf_dir / "model.safetensors.index.json").exists():
+  # Always fetch metadata + tokenizer up front (tiny). The decode wrapper
+  # consumes the tokenizer from this same directory, so we co-locate it
+  # rather than requiring a separate snapshot_download step.
+  metadata_files = [
+      "model.safetensors.index.json",
+      "config.json",
+      "tokenizer.json",
+      "tokenizer_config.json",
+      "special_tokens_map.json",
+      "chat_template.jinja",
+      "configuration_minimax_m2.py",
+  ]
+  missing_metadata = [fn for fn in metadata_files if not (hf_dir / fn).exists()]
+  if missing_metadata:
     from huggingface_hub import hf_hub_download
-    log("downloading index + config")
-    for fn in ["model.safetensors.index.json", "config.json"]:
-      hf_hub_download(repo_id=args.repo_id, filename=fn, local_dir=str(hf_dir))
+    log(f"downloading {len(missing_metadata)} metadata/tokenizer files")
+    for fn in missing_metadata:
+      try:
+        hf_hub_download(repo_id=args.repo_id, filename=fn, local_dir=str(hf_dir))
+      except Exception as exc:  # not every repo has every optional file
+        log(f"  skipping optional file {fn}: {exc}")
   with open(hf_dir / "model.safetensors.index.json", "rt") as f:
     weight_map = json.load(f)["weight_map"]
 
@@ -331,9 +347,28 @@ def main(args):
   first_layer = {fn: (min(ls) if min(ls) >= 0 else -1) for fn, ls in file_layers.items()}
   last_layer = {fn: (max(ls) if max(ls) >= 0 else -1) for fn, ls in file_layers.items()}
 
-  from huggingface_hub import hf_hub_download
+  from huggingface_hub import hf_hub_download, snapshot_download
+
+  # Parallel upfront fetch of every safetensors file this host will need.
+  # ~30 GB per host with `max_workers=8` saturates HF's CDN at ~1 GB/s
+  # instead of the sequential ~150 MB/s a single hf_hub_download achieves.
+  missing_data = [fn for fn in needed_files if not (hf_dir / fn).exists()]
+  if missing_data:
+    log(f"snapshot_download: {len(missing_data)} of {len(needed_files)} needed files missing")
+    t0 = time.time()
+    snapshot_download(
+        repo_id=args.repo_id,
+        local_dir=str(hf_dir),
+        allow_patterns=missing_data,
+        max_workers=args.hf_download_workers,
+    )
+    log(f"snapshot_download done in {time.time() - t0:.1f}s")
+  else:
+    log("all needed safetensors already on dtmpfs; skipping snapshot_download")
 
   def ensure_file(fn: str) -> None:
+    # Fallback in case a file got deleted prematurely by drop_file; the
+    # main download path is the upfront snapshot_download above.
     if (hf_dir / fn).exists():
       return
     hf_hub_download(repo_id=args.repo_id, filename=fn, local_dir=str(hf_dir))
@@ -365,13 +400,7 @@ def main(args):
   def fetch(name):
     return _get_tensor_bf16(weight_map, str(hf_dir), name, handle_cache)
 
-  log("downloading + writing non-layered leaves (embed / final norm / lm_head)")
-  for tname in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"):
-    ensure_file(weight_map[tname])
-    scale = f"{tname}_scale_inv"
-    if scale in weight_map:
-      ensure_file(weight_map[scale])
-
+  log("writing non-layered leaves (embed / final norm / lm_head)")
   emb = _np_from_torch(fetch("model.embed_tokens.weight"))
   write_replicated(arrs, per_dev_slices, "token_embedder.embedding", emb, local_devs)
   del emb
@@ -392,35 +421,8 @@ def main(args):
   H = p["hidden_size"]
   Hq, Hkv, D = p["num_attention_heads"], p["num_key_value_heads"], p["head_dim"]
 
-  log("writing per-layer leaves with just-in-time HF download")
+  log("writing per-layer leaves (all safetensors already on dtmpfs)")
   for L in tqdm(range(p["num_hidden_layers"]), desc="layers"):
-    # Download every file whose first_layer == L (or earlier and not yet present).
-    layer_files: Set[str] = set()
-    for tname in [
-        f"model.layers.{L}.input_layernorm.weight",
-        f"model.layers.{L}.post_attention_layernorm.weight",
-        f"model.layers.{L}.self_attn.q_proj.weight",
-        f"model.layers.{L}.self_attn.k_proj.weight",
-        f"model.layers.{L}.self_attn.v_proj.weight",
-        f"model.layers.{L}.self_attn.o_proj.weight",
-        f"model.layers.{L}.self_attn.q_norm.weight",
-        f"model.layers.{L}.self_attn.k_norm.weight",
-        f"model.layers.{L}.block_sparse_moe.gate.weight",
-        f"model.layers.{L}.block_sparse_moe.e_score_correction_bias",
-    ]:
-      if tname in weight_map:
-        layer_files.add(weight_map[tname])
-    for e in range(host_expert_lo, host_expert_hi):
-      for tail in ("w1", "w2", "w3"):
-        tname = f"model.layers.{L}.block_sparse_moe.experts.{e}.{tail}.weight"
-        if tname in weight_map:
-          layer_files.add(weight_map[tname])
-    # Include scale_inv files too
-    for fn in list(layer_files):
-      pass  # scale_inv is in the same file as its tensor for FP8 layouts
-    for fn in sorted(layer_files):
-      ensure_file(fn)
-
     write_layer_slice(arrs, per_dev_slices,
         "decoder.layers.pre_self_attention_layer_norm.scale", L,
         _np_from_torch(fetch(f"model.layers.{L}.input_layernorm.weight")), local_devs)
@@ -526,5 +528,8 @@ if __name__ == "__main__":
   parser.add_argument("--model_size", required=True, choices=list(MODEL_PARAMS_DICT))
   parser.add_argument("--repo_id", default="MiniMaxAI/MiniMax-M2.7")
   parser.add_argument("--skip_download", action="store_true")
+  parser.add_argument("--hf_download_workers", type=int, default=8,
+                      help="Parallel workers for snapshot_download (default 8). "
+                           "Bound by your HF auth tier and host network.")
   parser.add_argument("--maxtext_args", nargs=argparse.REMAINDER, default=[])
   main(parser.parse_args())

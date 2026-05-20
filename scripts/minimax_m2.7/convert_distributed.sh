@@ -8,6 +8,7 @@ set -euo pipefail
 DTMPFS_ROOT=/mnt/dtmpfs
 export HF_DIR="$DTMPFS_ROOT/minimax-m2.7-hf"
 export NPY_DIR="$DTMPFS_ROOT/minimax-m2.7-npy-distributed"
+HF_DOWNLOAD_WORKERS=${HF_DOWNLOAD_WORKERS:-8}
 LOG=$HOME/stream_dist.log
 exec > >(tee -a "$LOG") 2>&1
 
@@ -37,8 +38,9 @@ python -m maxtext.checkpoint_conversion.standalone_scripts.convert_minimax_m2_di
   --output_dir "$NPY_DIR" \
   --model_size minimax-m2.7 \
   --repo_id MiniMaxAI/MiniMax-M2.7 \
+  --hf_download_workers "$HF_DOWNLOAD_WORKERS" \
   --maxtext_args src/maxtext/configs/base.yml \
-    tokenizer_path="$HOME/minimax-m2.7-tokenizer" \
+    tokenizer_path="$HF_DIR" \
     tokenizer_type=huggingface \
     run_name=minimax-m2.7-convert \
     per_device_batch_size=1 \
