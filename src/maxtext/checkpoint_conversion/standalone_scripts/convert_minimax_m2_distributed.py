@@ -410,10 +410,40 @@ def main(args):
     except OSError:
       pass
 
+  # Idempotency: if this host's manifest exists and every expected .npy
+  # is present with the right size, skip the entire convert and just
+  # participate in the end-of-run barrier. Lets a re-run after partial
+  # failures finish quickly on the already-converted workers.
+  out_dir = pathlib.Path(args.output_dir)
+  manifest_path = out_dir / f"manifest.p{proc_idx}.json"
+  already_done = False
+  if manifest_path.exists():
+    expected_paths = []
+    for (leaf, d), idx in per_dev_slices.items():
+      shp = _local_shape_from_idx(idx)
+      expected_size = int(np.prod(shp)) * np.dtype(shapes[leaf][1]).itemsize
+      pth = out_dir / f"{leaf}.p{proc_idx}.d{d}.npy"
+      expected_paths.append((pth, expected_size))
+    missing_or_short = [p for (p, sz) in expected_paths
+                        if not p.exists() or os.path.getsize(p) < sz]
+    if not missing_or_short:
+      already_done = True
+      log(f"manifest + all {len(expected_paths)} shards present; skipping convert")
+
+  if already_done:
+    # Skip straight to the barrier so we don't tear down the cluster
+    # while slower workers are still converting.
+    try:
+      from jax.experimental import multihost_utils
+      multihost_utils.sync_global_devices("convert-done")
+      log("barrier-synced (skip path); exiting cleanly")
+    except Exception as exc:
+      log(f"sync_global_devices failed (non-fatal): {exc}")
+    return
+
   prefetch_shared()
 
   # 5) Open per-device memmaps for all leaves.
-  out_dir = pathlib.Path(args.output_dir)
   out_dir.mkdir(parents=True, exist_ok=True)
   arrs: Dict[Tuple[str, int], np.ndarray] = {}
   total_bytes = 0
@@ -553,6 +583,17 @@ def main(args):
   with open(out_dir / f"manifest.p{proc_idx}.json", "wt") as f:
     json.dump(manifest, f, indent=2)
   log(f"done; wrote manifest.p{proc_idx}.json")
+
+  # Wait for every process to finish writing before any exits. Without
+  # this, a fast worker would tear down the JAX distributed coordinator
+  # mid-write and the slow stragglers (90-98% complete) would crash with
+  # BarrierError ── leaving incomplete shards.
+  try:
+    from jax.experimental import multihost_utils
+    multihost_utils.sync_global_devices("convert-done")
+    log("all processes barrier-synced; exiting cleanly")
+  except Exception as exc:
+    log(f"sync_global_devices failed (non-fatal): {exc}")
 
 
 if __name__ == "__main__":

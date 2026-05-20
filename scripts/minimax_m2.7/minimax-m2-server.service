@@ -1,0 +1,32 @@
+[Unit]
+Description=MiniMax-M2.7 INT4 OpenAI-compatible server on v4-8
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kathirks_gc
+Group=kathirks_gc
+WorkingDirectory=/home/kathirks_gc/maxtext
+Environment=HOME=/home/kathirks_gc
+Environment=DTMPFS_ROOT=/mnt/dtmpfs
+Environment=MAXTEXT_SERVER_PORT=8000
+
+# Re-stage from GCS if tmpfs was wiped (no-op if already present).
+ExecStartPre=/usr/bin/bash -lc 'mountpoint -q /mnt/dtmpfs || sudo bash /home/kathirks_gc/maxtext/scripts/minimax_m2.7/setup_dtmpfs.sh /mnt/dtmpfs 350G'
+ExecStartPre=/usr/bin/bash -lc 'bash /home/kathirks_gc/maxtext/scripts/minimax_m2.7/reload_from_gcs.sh'
+
+ExecStart=/usr/bin/bash -lc 'bash /home/kathirks_gc/maxtext/scripts/minimax_m2.7/serve_v4_8.sh'
+
+# Health-gate the unit on /health returning 200.
+ExecStartPost=/usr/bin/bash -lc 'for i in $(seq 1 120); do curl -fsS http://127.0.0.1:8000/health >/dev/null && exit 0; sleep 5; done; exit 1'
+
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=20
+StandardOutput=append:/home/kathirks_gc/minimax-m2-server.service.log
+StandardError=append:/home/kathirks_gc/minimax-m2-server.service.log
+
+[Install]
+WantedBy=multi-user.target
