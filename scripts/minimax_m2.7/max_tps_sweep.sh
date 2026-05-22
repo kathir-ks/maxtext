@@ -13,23 +13,29 @@
 #   6. int4 + int8 kv at best batch              (most aggressive)
 set -euo pipefail
 
-NODE="${NODE:-node-v5e-64-europe-west4-b}"
-ZONE="${ZONE:-europe-west4-b}"
+NODE="${NODE:-node-v6e-64-europe-west4-a}"
+ZONE="${ZONE:-europe-west4-a}"
+# v6e supports ragged-all-to-all and benefits from sparse MoE → leave the
+# bench defaults (MEGABLOX=true SPARSE_MATMUL=true CAPACITY=-1.0). On v5e
+# the caller must set MEGABLOX=false SPARSE_MATMUL=false CAPACITY=2.0.
 OUT_DIR="${OUT_DIR:-${CLAUDE_JOB_DIR:-/tmp}/max_tps}"
 mkdir -p "$OUT_DIR"
 CSV="$OUT_DIR/max_tps.csv"
 
-#               id   quant  kv   batch  cap  comment
+#               id   quant  kv    batch  cap  comment
+# On v6e with megablox=true sparse_matmul=true, capacity_factor=-1.0 (no
+# token-dropping). Sparse routing means each token reads only 8/256
+# experts → much less memory bandwidth per step.
 declare -a TABLE=(
-  "1 ''   false 1  2.0 bf16-baseline"
-  "2 ''   false 4  2.0 bf16-batch4"
-  "3 ''   false 8  2.0 bf16-batch8"
-  "4 int8 false 1  2.0 int8-baseline"
-  "5 int8 true  1  2.0 int8-kvq"
-  "6 int8 true  4  2.0 int8-batch4"
-  "7 int8 true  8  2.0 int8-batch8"
-  "8 int8 true  16 2.0 int8-batch16"
-  "9 int4 true  8  2.0 int4-batch8"
+  "1 ''   false 1   -1.0 bf16-baseline"
+  "2 ''   false 4   -1.0 bf16-batch4"
+  "3 ''   false 8   -1.0 bf16-batch8"
+  "4 ''   true  8   -1.0 bf16-kvq8"
+  "5 int8 false 1   -1.0 int8-baseline"
+  "6 int8 true  4   -1.0 int8-batch4"
+  "7 int8 true  8   -1.0 int8-batch8"
+  "8 int8 true  16  -1.0 int8-batch16"
+  "9 int4 true  8   -1.0 int4-batch8"
 )
 
 want() { [[ -z "${CELLS:-}" ]] || [[ ",${CELLS}," == *",$1,"* ]]; }

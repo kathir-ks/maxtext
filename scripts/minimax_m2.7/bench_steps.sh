@@ -30,7 +30,7 @@ QUANT="${QUANT:-}"
 KV_QUANT="${KV_QUANT:-false}"
 KV_QUANT_DTYPE="${KV_QUANT_DTYPE:-int8}"
 BATCH="${BATCH:-1}"
-CAPACITY="${CAPACITY:-2.0}"
+CAPACITY="${CAPACITY:--1.0}"  # -1.0 = no token-dropping; megablox handles routing
 WEIGHT_DTYPE="${WEIGHT_DTYPE:-bfloat16}"
 PREFILL_LEN="${PREFILL_LEN:-32}"
 MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-256}"
@@ -38,6 +38,9 @@ WARMUP="${WARMUP:-4}"
 MEASURE="${MEASURE:-32}"
 ICI_TENSOR="${ICI_TENSOR:-8}"
 ICI_EXPERT="${ICI_EXPERT:-8}"
+# v6e supports ragged-all-to-all → enable sparse MoE; v5e must set both false.
+MEGABLOX="${MEGABLOX:-true}"
+SPARSE_MATMUL="${SPARSE_MATMUL:-true}"
 
 CELL_ID="${CELL_ID:-q${QUANT:-bf16}_kv${KV_QUANT}_b${BATCH}_cf${CAPACITY}}"
 BENCH_JSON=$HOME/bench_steps.${CELL_ID}.json
@@ -68,8 +71,8 @@ python -m maxtext.inference.bench_steps_minimax_m2_npy \
   kv_quant_dtype="$KV_QUANT_DTYPE" \
   weight_dtype="$WEIGHT_DTYPE" \
   attention=dot_product \
-  megablox=false \
-  sparse_matmul=false \
+  megablox="$MEGABLOX" \
+  sparse_matmul="$SPARSE_MATMUL" \
   capacity_factor="$CAPACITY"
 
 echo "[bench-steps] done cell=$CELL_ID finish=$(date -u +%FT%TZ)"
