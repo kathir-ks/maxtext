@@ -225,12 +225,46 @@ v5e constraints to be aware of: `attention=dot_product`, `megablox=false`,
 `sparse_matmul=false`. v5e ICI routing doesn't support ragged-all-to-all
 so the MoE falls back to capacity-bounded dense matmul routing.
 
-## Measured throughput on v5e-64
+## Measured throughput
 
-Validated on `node-v5e-64-europe-west4-b` (2026-05-20). All numbers from
-end-to-end `decode_distributed.sh` runs against the distributed shards.
-Compile cache populated on `/mnt/dtmpfs/jax_cache_v5e64` (9 entries,
-~9.6 MB) so the JIT step is amortized between runs.
+### v6e-64 (`node-v6e-64-europe-west4-a`, 2026-05-22)
+
+Sweep harness: `scripts/minimax_m2.7/bench_steps.sh` →
+`src/maxtext/inference/bench_steps_minimax_m2_npy.py` (prefill +
+warmup + 32 timed generate steps with `jax.block_until_ready` around
+each). Raw JSONs are in `benchmarks/v6e_minimax_m2_7_2026_05_22/`.
+v6e supports `megablox=true sparse_matmul=true` so the MoE actually
+reads only the 8 active experts per token instead of all 256.
+
+| Config | Per-device batch | Global batch | max_target | step_ms p50 | **tok/s pod-wide** | tok/s/chip | Use case |
+|---|---|---|---|---|---|---|---|
+| bf16 + bf16-kv | 1 | 64 | 256 | 74 | 860 | 13.4 | Single-stream latency |
+| bf16 + bf16-kv | 4 | 256 | 256 | 124 | 2,060 | 32.2 | Small-batch latency |
+| bf16 + bf16-kv | 8 | 512 | 256 | 182 | 2,818 | 44.0 | |
+| bf16 + int8-kv | 8 | 512 | 256 | 158 | 3,234 | 50.5 | |
+| bf16 + int8-kv | 16 | 1024 | 256 | 251 | 4,087 | 63.9 | |
+| bf16 + int8-kv | 32 | 2048 | 256 | 451 | 4,539 | 70.9 | Balanced |
+| bf16 + int4-kv | 64 | 4096 | 256 | 708 | 5,787 | 90.4 | |
+| bf16 + int4-kv | 64 | 4096 | 128 | 698 | 5,866 | 91.7 | |
+| **bf16 + int4-kv** | **96** | **6144** | **128** | **920** | **6,678** | **104.3** | **Max throughput** |
+
+Cells beyond batch=96 OOM at v6e's 32 GB/chip HBM (KV cache + activations
++ 7.2 GB weights/chip). Cells with `quantization=int8` weight-quant
+crash with a qwix Pallas-kernel assertion (`v=192 bv=1024 s=192`) because
+the per-chip MLP dim (192) doesn't divide the kernel's tile block (1024).
+Fixing that should unlock another ~1.5-2x headroom by halving weight
+bandwidth. Open issue tracked below.
+
+Best single-stream tok/s (interactive chat speed): **~13 tok/s** at
+batch=1.
+Best aggregate throughput (serving many concurrent users):
+**~6,700 tok/s** at batch=96 (6144 slots pod-wide).
+
+### v5e-64 (`node-v5e-64-europe-west4-b`, 2026-05-20, for reference)
+
+v5e's ICI doesn't support ragged-all-to-all → MoE falls back to dense
+matmul over all 256 experts, costing ~25× more memory bandwidth per
+token. Measured baseline only.
 
 | Config | Batch | Prefill | Decoded tokens | Total wall | tok/s pod-wide | tok/s/chip |
 |---|---|---|---|---|---|---|
@@ -252,18 +286,23 @@ Notes / caveats:
 
 ## Open issues
 
+- **int8 weight quantization** fails on v6e-64 with a qwix Pallas
+  block-spec assertion `v=192 bv=1024 s=192`. The per-chip MLP
+  intermediate dim (1536/8 = 192) doesn't divide qwix's default
+  Pallas tile block (1024). Likely fix: tune `wi_tile_*_mlp_dim` /
+  `wo_tile_*_embed_dim` to a divisor of 192 (e.g. 192 or 64) and
+  retry. Should unlock another ~1.5-2× peak throughput by halving
+  weight bandwidth.
 - `inference_microbenchmark.run_benchmarks` calls `engine.aot_compile`
   which freezes a `decode_state_layouts` and then expects every
   subsequent `engine.insert` / `engine.generate` to use the same
   sharding. With our custom `decode_minimax_m2_npy` load_params path
-  the params arrive correctly sharded but the engine-allocated cache
-  buffers (cache_ar_segment_id, cached_prefill_key, ...) report a
-  sharding mismatch on multi-host. Workaround for now: time the
-  existing `decode_distributed.sh` wall-clock and divide by token
-  count. Next step: build a custom benchmark that allocates the cache
-  via `make_array_from_callback` with the engine's
-  `decode_state_layouts` instead of relying on aot_compile's
-  in-process allocation.
+  the engine-allocated cache buffers report a sharding mismatch on
+  multi-host. Worked around by `bench_steps_minimax_m2_npy.py` which
+  does its own prefill+generate loop without aot_compile.
+- ICI mesh swaps (e.g. `tensor=4, expert=16`) require re-converting
+  the per-host shards since the .npy layout is baked-in to the mesh.
+  Re-conversion is ~30 min on v6e-64.
 
 ## File map
 

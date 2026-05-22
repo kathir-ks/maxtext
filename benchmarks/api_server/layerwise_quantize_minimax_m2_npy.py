@@ -283,44 +283,109 @@ def main() -> None:
   num_layers = config.num_decoder_layers
   assert config.first_num_dense_layers == 0, "MiniMax-M2 has no dense layers"
 
-  quantized: dict = {"params": {"decoder": {}}, "aqt": {"decoder": {}}}
+  # Per-layer staging directory on tmpfs (RAM-backed but big) so we keep at
+  # most ONE layer's worth of AQT pytree alive in Python at a time.
+  import pickle
+  stage_dir = pathlib.Path("/mnt/dtmpfs/lw_quant_stage")
+  stage_dir.mkdir(parents=True, exist_ok=True)
+  for f in stage_dir.iterdir():
+    f.unlink()
 
   for index in tqdm(range(num_layers), desc="layers"):
     layer_name = f"layers_{index}"
     raw = load_layer_params_from_npy(npy_dir, index, weight_dtype)
 
-    # Layer.apply expects {"params": layer_params, "aqt": {}}
     with nn_partitioning.axis_rules(config.logical_axis_rules):
       _, new_vars = model_apply({"params": raw}, rng_quant)
 
     if "aqt" not in new_vars or not new_vars["aqt"]:
       max_logging.log(f"[lw-quant] no AQT vars from {layer_name}; keeping bf16")
-      quantized["params"]["decoder"][layer_name] = raw
+      to_save = {"params": raw, "aqt": None}
     else:
-      aqt_vars = new_vars["aqt"]
+      aqt_vars = dict(new_vars["aqt"])
+      # MiniMax-M2 MoE expert weights are stored in params at
+      # moe_block/wi_{0,1}/wo (no `/kernel` suffix) but appear in the AQT
+      # collection as top-level `AqtEinsum_{0,1,2}` (Flax names einsums
+      # generically). The shared `remove_quantized_params` tries to map every
+      # AQT path to `<parent>/kernel` in params, which fails for these. Handle
+      # them manually: pop the AQT einsums + their matching bf16 expert
+      # weights out, run remove_quantized_params on the remainder (where the
+      # path-to-kernel mapping does work), then stitch them back under
+      # moe_block/ as wi_{0,1,wo}.
+      moe_einsum_to_param = {
+          "AqtEinsum_0": ("moe_block", "wi_0"),
+          "AqtEinsum_1": ("moe_block", "wi_1"),
+          "AqtEinsum_2": ("moe_block", "wo"),
+      }
+      moe_expert_aqt = {}
+      for einsum_key, (block_key, leaf_key) in moe_einsum_to_param.items():
+        if einsum_key in aqt_vars:
+          moe_expert_aqt[(block_key, leaf_key)] = aqt_vars.pop(einsum_key)
+          if block_key in raw and leaf_key in raw[block_key]:
+            raw[block_key].pop(leaf_key)
       try:
         removed = remove_quantized_params(raw, aqt_vars)
-        quantized["params"]["decoder"][layer_name] = removed
-        quantized["aqt"]["decoder"][layer_name] = aqt_vars
       except Exception as e:  # pylint: disable=broad-except
         max_logging.log(f"[lw-quant] {layer_name} remove_quantized_params failed: {e}")
-        max_logging.log("[lw-quant] raw layer keys:")
         jax.tree_util.tree_map_with_path(
-            lambda p, _: max_logging.log(f"  {jax.tree_util.keystr(p)}"), raw)
-        max_logging.log("[lw-quant] aqt_vars keys:")
+            lambda p, _: max_logging.log(f"  raw {jax.tree_util.keystr(p)}"), raw)
         jax.tree_util.tree_map_with_path(
-            lambda p, _: max_logging.log(f"  {jax.tree_util.keystr(p)}"), aqt_vars)
+            lambda p, _: max_logging.log(f"  aqt {jax.tree_util.keystr(p)}"), aqt_vars)
         raise
+      # Stitch the MoE expert AQT data back under moe_block/ as wi_*/wo so
+      # serve-side load can find them.
+      if moe_expert_aqt:
+        moe_block_aqt = dict(aqt_vars.get("moe_block", {}))
+        for (block_key, leaf_key), aqt_data in moe_expert_aqt.items():
+          assert block_key == "moe_block"
+          moe_block_aqt[leaf_key] = aqt_data
+        aqt_vars["moe_block"] = moe_block_aqt
+      # Pull everything from JAX device buffers to host numpy before pickling.
+      removed = jax.tree.map(
+          lambda x: jax.device_get(x) if isinstance(x, jax.Array) else x, removed)
+      aqt_vars = jax.tree.map(
+          lambda x: jax.device_get(x) if isinstance(x, jax.Array) else x, aqt_vars)
+      to_save = {"params": removed, "aqt": aqt_vars}
 
-    # Drop the raw layer arrays from RAM before moving on.
-    del raw, new_vars
+    # Drop straight to disk and free Python refs.
+    with open(stage_dir / f"{layer_name}.pkl", "wb") as f:
+      pickle.dump(to_save, f, protocol=pickle.HIGHEST_PROTOCOL)
+    del raw, new_vars, to_save
+    if "aqt_vars" in dir():
+      del aqt_vars
+    if "removed" in dir():
+      del removed
     gc.collect()
+    try:
+      jax.clear_caches()
+    except Exception:  # pylint: disable=broad-except
+      pass
+
+  # Reassemble + save. Each layer is loaded back in order.
+  quantized: dict = {"params": {"decoder": {}}, "aqt": {"decoder": {}}}
+  for index in range(num_layers):
+    layer_name = f"layers_{index}"
+    with open(stage_dir / f"{layer_name}.pkl", "rb") as f:
+      stage = pickle.load(f)
+    quantized["params"]["decoder"][layer_name] = stage["params"]
+    if stage["aqt"] is not None:
+      quantized["aqt"]["decoder"][layer_name] = stage["aqt"]
+    del stage
+  gc.collect()
 
   # Non-layered (embedding, final norm, lm head) stay bf16.
   nonlayered = load_nonlayered_from_npy(npy_dir, weight_dtype)
-  quantized["params"]["token_embedder"] = nonlayered["token_embedder"]
-  quantized["params"]["decoder"]["decoder_norm"] = nonlayered["decoder"]["decoder_norm"]
-  quantized["params"]["decoder"]["logits_dense"] = nonlayered["decoder"]["logits_dense"]
+  quantized["params"]["token_embedder"] = jax.tree.map(
+      lambda x: jax.device_get(x) if isinstance(x, jax.Array) else x,
+      nonlayered["token_embedder"])
+  quantized["params"]["decoder"]["decoder_norm"] = jax.tree.map(
+      lambda x: jax.device_get(x) if isinstance(x, jax.Array) else x,
+      nonlayered["decoder"]["decoder_norm"])
+  quantized["params"]["decoder"]["logits_dense"] = jax.tree.map(
+      lambda x: jax.device_get(x) if isinstance(x, jax.Array) else x,
+      nonlayered["decoder"]["logits_dense"])
+  del nonlayered
+  gc.collect()
 
   max_logging.log(f"[lw-quant] saving AQT checkpoint to {config.save_quantized_params_path}")
   maxtext_utils.save_quantized_checkpoint_if_configured(config, quantized)

@@ -1,0 +1,4 @@
+cell,comment,quant,kv,batch,cap,prefill_ms,step_ms_p50,step_ms_p90,tok_s_pod,tok_s_chip
+2,bf16-batch4,bf16,false,4,-1.0,,,,,FAIL
+3,bf16-batch8,bf16,false,8,-1.0,,,,,FAIL
+4,bf16-kvq8,bf16,true,8,-1.0,,,,,FAIL
