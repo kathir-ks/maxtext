@@ -1,0 +1,9 @@
+cell_id,batch,max_target,kv_quant,kv_quant_dtype,inner_seconds
+b1_t128,1,128,false,int8,46
+b1_t512,1,512,false,int8,90
+b4_t256_kvq,4,256,true,int8,108
+b1_t256_kvq,1,256,true,int8,60
+b2_t256_kvq,2,256,true,int8,76
+b4_t256_kvq4,4,256,true,int4,104
+b8_t256_kvq4,8,256,true,int4,170
+b16_t128_kvq4,16,128,true,int4,FAIL

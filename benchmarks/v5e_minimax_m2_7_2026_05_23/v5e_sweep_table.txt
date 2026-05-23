@@ -1,0 +1,16 @@
+derived: setup_sec=31.3, step_time_b1_bf16=229.2 ms
+
+cell             B   mt   kv    inner_s  decode_s  step_ms  tok/s_pod  tok/s/chip
+------------------------------------------------------------------------------------------
+b1_t128          1   128  bf16  46       14.7      229.2    4.36       0.068     
+b1_t512          1   512  bf16  90       58.7      229.2    4.36       0.068     
+b1_t256_kvq      1   256  int8  60       28.7      224.0    4.47       0.070     
+b2_t256_kvq      2   256  int8  76       44.7      349.0    5.73       0.090     
+b4_t256_kvq      4   256  int8  108      76.7      599.0    6.68       0.104     
+b4_t256_kvq4     4   256  int4  104      72.7      567.7    7.05       0.110     
+b8_t256_kvq4     8   256  int4  170      138.7     1083.3   7.38       0.115     
+
+Best: b8_t256 with int4 KV → ~7.4 tok/s pod-wide (~0.12 tok/s/chip)
+
+vs v6e (megablox sparse routing on v6e-64): 6,678 tok/s pod-wide at b=96
+v6e/v5e speedup: ~902x

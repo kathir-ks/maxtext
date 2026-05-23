@@ -260,15 +260,42 @@ batch=1.
 Best aggregate throughput (serving many concurrent users):
 **~6,700 tok/s** at batch=96 (6144 slots pod-wide).
 
-### v5e-64 (`node-v5e-64-europe-west4-b`, 2026-05-20, for reference)
+### v5e-64 (`node-v5e-64-europe-west4-b`, 2026-05-23)
 
 v5e's ICI doesn't support ragged-all-to-all → MoE falls back to dense
-matmul over all 256 experts, costing ~25× more memory bandwidth per
-token. Measured baseline only.
+matmul over all 256 experts (`megablox=false sparse_matmul=false
+capacity_factor=2.0`), costing ~25× more memory bandwidth per token
+than v6e's sparse routing. Sweep done via `decode_distributed.sh` at
+varying `BATCH` and `MAX_TARGET_LENGTH`; step time derived from the
+inner wall-time differential `(inner_s − setup) / decoded_tokens`,
+with `setup ≈ 31 s` computed from the batch=1 differential at
+mt=128 vs mt=512. Raw CSV: `benchmarks/v5e_minimax_m2_7_2026_05_23/v5e_results.csv`.
 
-| Config | Batch | Prefill | Decoded tokens | Total wall | tok/s pod-wide | tok/s/chip |
-|---|---|---|---|---|---|---|
-| bf16, capacity_factor=2.0 | 1 | 8 | 120 | 46 s | ~5 | ~0.08 |
+| Config | Per-device batch | Global batch | step_ms | tok/s pod | tok/s/chip |
+|---|---|---|---|---|---|
+| bf16, kv-bf16 | 1 | 64 | 229 | 4.36 | 0.068 |
+| bf16, kv-int8 | 1 | 64 | 224 | 4.47 | 0.070 |
+| bf16, kv-int8 | 2 | 128 | 349 | 5.73 | 0.090 |
+| bf16, kv-int8 | 4 | 256 | 599 | 6.68 | 0.104 |
+| bf16, kv-int4 | 4 | 256 | 568 | 7.05 | 0.110 |
+| **bf16, kv-int4** | **8** | **512** | **1083** | **7.38** | **0.115** |
+| (batch≥16 ctx≥128, or batch=4 without kv-quant) | | | | OOM | |
+
+Step time grows almost linearly with batch (229 ms → 1083 ms for 1→8) —
+dense MoE is compute-bound at batch ≥ 2, so the throughput cliff is the
+combination of (HBM cap + compute cost per batch). Batch=8 + int4 KV
+is the practical max.
+
+**v5e vs v6e comparison:** v6e-64 max = 6,678 tok/s pod-wide, v5e-64
+max = 7.4 → **v6e is ~900× faster** for this model. The gap comes from:
+- v6e supports `megablox` ragged-all-to-all → sparse routing (8/256
+  experts active per token instead of all 256) → 25-30× less bandwidth
+  per step
+- v6e per-chip HBM bandwidth ~2× higher
+- v6e per-chip compute ~3× higher
+
+If you must use v5e for this model: budget for ~7 tok/s pod-wide at
+the absolute max, and don't expect single-user latency below 230 ms/token.
 
 Notes / caveats:
 - Wall time includes pyconfig + engine init + abstract_state + JIT
