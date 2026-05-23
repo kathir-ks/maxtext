@@ -361,35 +361,15 @@ def main() -> None:
     except Exception:  # pylint: disable=broad-except
       pass
 
-  # Reassemble + save. Each layer is loaded back in order.
-  quantized: dict = {"params": {"decoder": {}}, "aqt": {"decoder": {}}}
-  for index in range(num_layers):
-    layer_name = f"layers_{index}"
-    with open(stage_dir / f"{layer_name}.pkl", "rb") as f:
-      stage = pickle.load(f)
-    quantized["params"]["decoder"][layer_name] = stage["params"]
-    if stage["aqt"] is not None:
-      quantized["aqt"]["decoder"][layer_name] = stage["aqt"]
-    del stage
-  gc.collect()
-
-  # Non-layered (embedding, final norm, lm head) stay bf16.
-  nonlayered = load_nonlayered_from_npy(npy_dir, weight_dtype)
-  quantized["params"]["token_embedder"] = jax.tree.map(
-      lambda x: jax.device_get(x) if isinstance(x, jax.Array) else x,
-      nonlayered["token_embedder"])
-  quantized["params"]["decoder"]["decoder_norm"] = jax.tree.map(
-      lambda x: jax.device_get(x) if isinstance(x, jax.Array) else x,
-      nonlayered["decoder"]["decoder_norm"])
-  quantized["params"]["decoder"]["logits_dense"] = jax.tree.map(
-      lambda x: jax.device_get(x) if isinstance(x, jax.Array) else x,
-      nonlayered["decoder"]["logits_dense"])
-  del nonlayered
-  gc.collect()
-
-  max_logging.log(f"[lw-quant] saving AQT checkpoint to {config.save_quantized_params_path}")
-  maxtext_utils.save_quantized_checkpoint_if_configured(config, quantized)
-  max_logging.log("[lw-quant] done")
+  # NB: we DON'T reassemble + Orbax-save here. Orbax PyTreeCheckpointer.save
+  # peaks at ~2x the pytree RAM during serialization, and 217 GB pytree on a
+  # 400 GB host OOM-kills the process before any bytes hit disk. Instead we
+  # keep the per-layer pickles and the original non-layered .npy files; the
+  # serving wrapper (`serve_minimax_m2_from_pickles.py`) plugs them straight
+  # into MaxEngine, skipping both Orbax load AND quantize_params.
+  max_logging.log(f"[lw-quant] {num_layers} per-layer AQT pickles written to {stage_dir}")
+  max_logging.log("[lw-quant] non-layered weights remain at {} (token_embedder, decoder_norm, logits_dense)".format(npy_dir))
+  max_logging.log("[lw-quant] done — invoke serving via benchmarks.api_server.serve_minimax_m2_from_pickles")
 
 
 if __name__ == "__main__":

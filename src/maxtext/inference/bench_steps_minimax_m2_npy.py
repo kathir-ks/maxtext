@@ -56,8 +56,10 @@ def main():
   from maxtext.inference import decode_minimax_m2_npy as _dnpy
   _dnpy.install_load_params_patch(npy_dir)
 
+  # Don't call jax.distributed.initialize() ourselves — pyconfig.initialize
+  # does it based on the `skip_jax_distributed_system` knob. Double-init
+  # works on v6e but silent-kills the process on v5e.
   import jax
-  jax.distributed.initialize()
   from maxtext.configs import pyconfig
   from maxtext.inference.maxengine import maxengine
 
