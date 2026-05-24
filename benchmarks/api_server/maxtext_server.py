@@ -35,7 +35,7 @@ import uuid
 
 import uvicorn
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 
 import jax
 import jax.numpy as jnp
@@ -60,6 +60,9 @@ from benchmarks.api_server.server_models import (
 )
 from benchmarks.api_server import server_utils
 from benchmarks.api_server.encoding import encoding_dsv32
+from benchmarks.api_server import health as health_mod
+from benchmarks.api_server.auth_middleware import require_api_key
+from benchmarks.api_server.anthropic_adapter import router as anthropic_router
 
 # ----------------------------
 # Init
@@ -71,6 +74,10 @@ logging.basicConfig(level=logging.WARNING)
 print("Initializing MaxTextGenerator and JAX distributed system...")
 LLM = MaxTextGenerator(sys.argv)
 rank = jax.process_index()
+# Signal /ready=200. Workers (rank != 0) also set this for symmetry; only
+# rank 0 actually serves the endpoint, but keeping the global consistent
+# avoids accidental footguns if /ready is ever probed from another rank.
+health_mod.mark_ready()
 
 # Now that JAX is initialized, we can get our rank-specific logger.
 # The actual handler/formatter configuration will be done by Uvicorn.
@@ -89,6 +96,12 @@ except (RuntimeError, ValueError) as e:
 
 
 app = FastAPI()
+# Health, readiness, and metrics endpoints are unauthenticated so that
+# IAP probes, systemd ExecStartPost, and monitoring can reach them.
+app.include_router(health_mod.router)
+# Anthropic /v1/messages adapter (Claude Code-compatible). Protected
+# by the same bearer-token dep as the OpenAI routes.
+app.include_router(anthropic_router, dependencies=[Depends(require_api_key)])
 
 # Global state for communication between threads.
 request_queue = queue.Queue()
@@ -126,6 +139,7 @@ async def _queue_and_wait_for_response(request: Union[CompletionRequest, ChatCom
   """
   request_id = f"req_{uuid.uuid4().hex}"
   request_queue.put((request_id, request))
+  health_mod.record_queued()
 
   start_time = time.time()
   while time.time() - start_time < REQUEST_TIMEOUT_S:
@@ -141,26 +155,35 @@ async def _queue_and_wait_for_response(request: Union[CompletionRequest, ChatCom
   raise HTTPException(status_code=504, detail="Request timed out.")
 
 
-@app.post("/v1/completions", response_model=CompletionResponse)
+@app.post("/v1/completions", response_model=CompletionResponse, dependencies=[Depends(require_api_key)])
 async def create_completion(request: CompletionRequest):
   """Handles completion requests with dynamic batching."""
   return await _queue_and_wait_for_response(request)
 
 
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+@app.post(
+    "/v1/chat/completions", response_model=ChatCompletionResponse, dependencies=[Depends(require_api_key)]
+)
 async def create_chat_completion(request: ChatCompletionRequest):
   """Handles chat completion requests with dynamic batching."""
   return await _queue_and_wait_for_response(request)
 
 
-@app.get("/")
-def health_check():
-  """
-  Provides a simple health check endpoint.
+@app.get("/v1/models", dependencies=[Depends(require_api_key)])
+def list_models():
+  """OpenAI-style model listing. Server hosts exactly one model."""
+  model_name = getattr(LLM.config, "model_name", "minimax-m2.7")
+  return {
+      "object": "list",
+      "data": [
+          {"id": model_name, "object": "model", "owned_by": "maxtext", "created": 0}
+      ],
+  }
 
-  Returns:
-      A dictionary indicating the server status.
-  """
+
+@app.get("/")
+def root():
+  """Simple landing endpoint (unauthenticated, equivalent to /health)."""
   return {"status": "ok", "message": "MaxText API server is running."}
 
 
@@ -283,6 +306,7 @@ def _collect_batched_requests():
     try:
       item = request_queue.get(timeout=0.01)
       batched_items.append(item)
+      health_mod.record_dequeued()
     except queue.Empty:
       if batched_items:
         break  # Process what we have if timeout is reached
@@ -337,14 +361,26 @@ def _process_results(completions, request_info_map, payload):
   """Processes completions and sends responses back to the waiting threads."""
   logger.info("Batched generation finished. Processing %d completions.", len(completions))
   completion_idx = 0
+  batch_prompt_tokens = 0
+  batch_completion_tokens = 0
   for req_id, req, is_chat, num_prompts in request_info_map:
     completions_for_req = completions[completion_idx : completion_idx + num_prompts]
     prompts_for_req = payload["prompts"][completion_idx : completion_idx + num_prompts]
     completion_idx += num_prompts
 
+    for item in completions_for_req:
+      batch_prompt_tokens += getattr(item, "prompt_token_count", 0)
+      batch_completion_tokens += getattr(item, "completion_token_count", 0)
+
     response = _create_response(req, completions_for_req, prompts_for_req, is_chat, LLM)
     with response_lock:
       response_dict[req_id] = response
+
+  health_mod.record_batch_complete(
+      num_prompts=len(request_info_map),
+      prompt_tokens=batch_prompt_tokens,
+      completion_tokens=batch_completion_tokens,
+  )
 
 
 def main_loop():
