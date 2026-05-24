@@ -463,6 +463,22 @@ class ToLinen(linen.Module):
 
       warnings.warn(f"Found unknown module paths in incoming state:{paths_str}")
 
+      # BEGIN unknown-attr patch
+      # For top-level attrs that exist on the incoming new_state but not on
+      # `module` yet (e.g. AqtEinsum_4/5/6 auto-created by AQT during forward),
+      # pre-declare them as nnx.data so nnx.update's strict pytree check
+      # accepts the subsequent setattr. Without this, loading pre-quantized
+      # MoE checkpoints fails because the decoder-layer class never declares
+      # the AQT-injected einsum modules as class-level data attributes.
+      unknown_roots = {path[0] for path in unknown_state_flat.keys() if path}
+      for root in unknown_roots:
+        if not hasattr(module, root):
+          try:
+            setattr(module, root, nnx.data({}))
+          except Exception:
+            pass
+      # END unknown-attr patch
+
     nnx.update(module, new_state)
 
     _fix_for_qwix_quantization(module)
