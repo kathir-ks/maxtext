@@ -357,3 +357,13 @@ Notes / caveats:
 | `scripts/minimax_m2.7/benchmark_distributed.sh` | Per-cell benchmark driver |
 | `scripts/minimax_m2.7/sweep.sh` | Iterates the Phase-2 config sweep + aggregates CSV |
 | `scripts/minimax_m2.7/decode_{v5e,v6e}.sh` | Single-host decode (legacy) |
+
+## Serving (HTTP API)
+
+For OpenAI- and Anthropic-compatible HTTP serving on the 16-host v6e-64 pod
+(IAP tunnel only, bearer-token defense-in-depth, dtmpfs-backed weight load),
+see [minimax_m2.7_api_server.md](minimax_m2.7_api_server.md).
+Endpoints: `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
+plus unauthenticated `/health`, `/ready`, `/metrics`. Bring-up via
+`scripts/minimax_m2.7/launch_serve_v6e_64.sh` (SSH+nohup) or
+`scripts/minimax_m2.7/install_systemd_v6e64.sh` (systemd).
