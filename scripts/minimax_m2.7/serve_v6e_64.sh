@@ -36,9 +36,11 @@ mkdir -p "$JAX_CACHE_DIR"
 
 # Serving defaults (overridable via env). Different sweet spot from
 # the throughput benchmark: prefer headroom over peak tok/s.
-BATCH="${BATCH:-8}"
-MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-8192}"
-PREFILL_LEN="${PREFILL_LEN:-4096}"
+# B=8/MTL=8192 OOMs HBM (33.32G/31.25G); B=4/MTL=4096 fits.
+# Phase 4 sweep will re-tune; this is the conservative starting cell.
+BATCH="${BATCH:-4}"
+MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-4096}"
+PREFILL_LEN="${PREFILL_LEN:-2048}"
 ICI_TENSOR="${ICI_TENSOR:-8}"
 ICI_EXPERT="${ICI_EXPERT:-8}"
 WEIGHT_DTYPE="${WEIGHT_DTYPE:-bfloat16}"
