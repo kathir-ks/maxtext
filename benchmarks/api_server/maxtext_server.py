@@ -41,11 +41,18 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import multihost_utils
 
-from openai_harmony import (
-    load_harmony_encoding,
-    HarmonyEncodingName,
-    Role,
-)
+try:
+  from openai_harmony import (
+      load_harmony_encoding,
+      HarmonyEncodingName,
+      Role,
+  )
+  _HARMONY_AVAILABLE = True
+except ImportError:
+  load_harmony_encoding = None  # type: ignore[assignment]
+  HarmonyEncodingName = None  # type: ignore[assignment]
+  Role = None  # type: ignore[assignment]
+  _HARMONY_AVAILABLE = False
 
 from benchmarks.api_server.maxtext_generator import MaxTextGenerator
 from benchmarks.api_server.server_models import (
@@ -86,13 +93,14 @@ logger.setLevel(logging.INFO)  # Ensure our logger passes INFO messages.
 logger.info("MaxTextGenerator initialization complete.")
 
 harmony_enc = None
-try:
-  harmony_enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-  logger.info("Harmony encoding for gpt-oss loaded successfully.")
-except ImportError:
-  logger.warning("openai_harmony not installed. GPT-OSS Harmony format will not be available.")
-except (RuntimeError, ValueError) as e:
-  logger.error("Failed to load Harmony encoding: %s", e, exc_info=True)
+if _HARMONY_AVAILABLE:
+  try:
+    harmony_enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    logger.info("Harmony encoding for gpt-oss loaded successfully.")
+  except (RuntimeError, ValueError) as e:
+    logger.error("Failed to load Harmony encoding: %s", e, exc_info=True)
+else:
+  logger.info("openai_harmony not installed; GPT-OSS Harmony format unavailable (not needed for MiniMax-M2.7).")
 
 
 app = FastAPI()
