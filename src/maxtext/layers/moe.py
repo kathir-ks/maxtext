@@ -2265,6 +2265,26 @@ class RoutedMoE(nnx.Module):
       output, lb_loss, bias_updates = self.fused_moe_matmul(
           inputs, gate_logits, wo_kernel, w0_kernel=w0_kernel, w1_kernel=w1_kernel, fused_kernel=fused_kernel
       )
+    elif getattr(cfg, "routed_moe_path", "auto") == "v5e_allgather":
+      # v5e-friendly sparse MoE: avoids ragged_all_to_all (unsupported on
+      # v5e ICI) by using all_gather + static-padded local select + a
+      # Pallas grouped-GEMM. See src/maxtext/layers/moe_v5e_allgather.py.
+      from maxtext.layers import moe_v5e_allgather  # local import: keeps
+      # the Pallas / numpy import cost off the hot path on v6e.
+      output, lb_loss, bias_updates = moe_v5e_allgather.v5e_allgather_moe_forward(
+          cfg,
+          self._expert_parallelism_name,
+          self._tensor_parallelism_name,
+          inputs,
+          gate_logits,
+          pre_bias_logits,
+          w0_kernel,
+          w1_kernel,
+          wo_kernel,
+          w0_bias,
+          w1_bias,
+          wo_bias,
+      )
     elif cfg.sparse_matmul:
       if quantizations.in_serve_mode(self.quant):
         w0_kernel, w1_kernel, wo_kernel = self.retrieve_quantized_weight(

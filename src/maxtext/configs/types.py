@@ -735,6 +735,18 @@ class MoEKernels(BaseModel):
 
   megablox: bool = Field(True, description="Whether to use Megablox kernels for MoE.")
   sparse_matmul: bool = Field(True, description="Whether to use sparse matmul kernels for MoE.")
+  routed_moe_path: str = Field(
+      "auto",
+      description=(
+          "Which RoutedMoE forward implementation to use. 'auto' (default) "
+          "falls through to the existing megablox/sparse_matmul/dense dispatch "
+          "based on those flags. 'v5e_allgather' selects the v5e-friendly "
+          "Pallas-backed sparse path that avoids ragged_all_to_all (needed "
+          "on TPU v5e where ragged-all-to-all is unsupported on the ICI). "
+          "Other values: 'megablox', 'sparse_matmul', 'dense' force a specific "
+          "path bypassing the auto-selection."
+      ),
+  )
   wi_tile_fwd_batch_seq: int = Field(
       512,
       description="forward pass tiling dimension for batch/sequence in GMM for wi.",
