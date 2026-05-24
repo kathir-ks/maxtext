@@ -71,8 +71,11 @@ def main():
   uvicorn.Config = _patched_Config
   uvicorn.run = _patched_run
 
-  from benchmarks.api_server import maxtext_server
+  # IMPORTANT: maxtext_server runs MaxTextGenerator(sys.argv) at module
+  # IMPORT time, so sys.argv must be cleaned BEFORE the import or it
+  # will pass --npy_dir (which we already stripped) through to pyconfig.
   sys.argv = ["maxtext_server"] + rest
+  from benchmarks.api_server import maxtext_server
   maxtext_server.main()
 
 
