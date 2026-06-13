@@ -1089,8 +1089,12 @@ class RoutedMoE(nnx.Module):
       lhs_quantize_dtype, rhs_quantize_dtype = None, None
       if self.quant is not None:
         quant_dg = self.quant.quant_dg
-        lhs_quantize_dtype = quant_dg.fwd.dg_quantizer.lhs.numerics.get_dtype()
-        rhs_quantize_dtype = quant_dg.fwd.dg_quantizer.rhs.numerics.get_dtype()
+        # quant_dg may be a dict (mixed-precision config); only flat AQT configs
+        # expose .fwd.  These dtypes are used only by tokamax/megablox branches,
+        # not by the jax.lax.ragged_dot branch, so returning None is safe here.
+        if not isinstance(quant_dg, dict):
+          lhs_quantize_dtype = quant_dg.fwd.dg_quantizer.lhs.numerics.get_dtype()
+          rhs_quantize_dtype = quant_dg.fwd.dg_quantizer.rhs.numerics.get_dtype()
       return lhs_quantize_dtype, rhs_quantize_dtype
 
     def gmm(inputs, kernel, tiling, group_sizes, expert_assignments, weight_gather_axes):
@@ -2262,7 +2266,9 @@ class RoutedMoE(nnx.Module):
           inputs, gate_logits, wo_kernel, w0_kernel=w0_kernel, w1_kernel=w1_kernel, fused_kernel=fused_kernel
       )
     elif cfg.sparse_matmul:
-      if quantizations.in_serve_mode(self.quant):
+      if quantizations.in_serve_mode(self.quant) and hasattr(self, "variables"):
+        # Linen mode: frozen int4 weights are in self.variables["aqt"]; trigger
+        # materialization via dense_matmul then extract.
         w0_kernel, w1_kernel, wo_kernel = self.retrieve_quantized_weight(
             inputs,
             gate_logits,
@@ -2274,6 +2280,9 @@ class RoutedMoE(nnx.Module):
             w1_bias,
             wo_bias,
         )
+      # NNX mode: the pickle loader already replaced self.wi_0/wi_1/wo with the
+      # actual AQT QTensors (or bfloat16 arrays); w0/w1/wo_kernel already hold
+      # the real weights and can be passed directly to sparse_matmul.
       output, lb_loss, bias_updates = self.sparse_matmul(
           inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias
       )

@@ -171,7 +171,13 @@ class MaxTextGenerator:
 
     self.logger.info("Chat Template available: %s", self.has_chat_template)
 
-    self.batch_size = int(self.config.per_device_batch_size * jax.device_count())
+    # Compute the data-parallel replica count, excluding TP and EP axes.
+    # jax.device_count() counts all chips; with TP=t, EP=e, there are
+    # device_count/(t*e) replicas, each running one sample of the batch.
+    tp = max(1, getattr(self.config, "ici_tensor_parallelism", 1))
+    ep = max(1, getattr(self.config, "ici_expert_parallelism", 1))
+    dp = max(1, jax.device_count() // (tp * ep))
+    self.batch_size = int(self.config.per_device_batch_size * dp)
 
     self.rng, rng_init_decode = jax.random.split(self.rng)
     self.decode_state = self.engine.init_decode_state(rng=rng_init_decode)
